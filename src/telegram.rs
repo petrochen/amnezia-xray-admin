@@ -170,10 +170,10 @@ pub fn format_users_message(users: &[(XrayUser, TrafficStats, u32)]) -> String {
 }
 
 /// Format the /add success response.
-pub fn format_add_message(name: &str, uuid: &str, vless_url: &str) -> String {
+pub fn format_add_message(name: &str, uuid: &str, bridge_url: &str) -> String {
     format!(
-        "✅ User '{}' added.\n\nUUID: {}\n\n📱 vless:// (sing-box, v2rayN):\n<pre>{}</pre>",
-        name, uuid, vless_url
+        "✅ User '{}' added.\n\nUUID: {}\n\n🏠 Bridge (censored regions):\n<pre>{}</pre>",
+        name, uuid, bridge_url
     )
 }
 
@@ -692,15 +692,15 @@ async fn cmd_users(state: &BotState) -> std::result::Result<String, crate::error
     Ok(format_users_message(&user_data))
 }
 
-/// Execute /add command: add a user, return UUID + vless URL.
+/// Execute /add command: add a user, return UUID + bridge URL.
 async fn cmd_add(
     state: &BotState,
     name: &str,
 ) -> std::result::Result<String, crate::error::AppError> {
     let client = XrayApiClient::new(state.backend.as_ref());
     let uuid = client.add_user(name).await?;
-    let vless_url = backend::build_vless_url(state.backend.as_ref(), &uuid).await?;
-    Ok(format_add_message(name, &uuid, &vless_url))
+    let bridge_url = backend::build_bridge_vless_url(state.backend.as_ref(), &uuid).await?;
+    Ok(format_add_message(name, &uuid, &bridge_url))
 }
 
 /// Execute /delete prompt: find user and return confirmation message with inline keyboard.
@@ -750,7 +750,7 @@ async fn cmd_user_keyboard(
     Ok(build_user_keyboard(&users, callback_prefix))
 }
 
-/// Execute /url command: get vless:// URL for a user.
+/// Execute /url command: get both bridge and direct vless:// URLs for a user.
 async fn cmd_url(
     state: &BotState,
     name: &str,
@@ -763,15 +763,20 @@ async fn cmd_url(
         .find(|u| u.name == name)
         .ok_or_else(|| crate::error::AppError::Xray(format!("user '{}' not found", name)))?;
 
-    let vless_url = backend::build_vless_url(state.backend.as_ref(), &user.uuid).await?;
-    Ok(format_url_message(name, &vless_url))
+    let bridge_url = backend::build_bridge_vless_url(state.backend.as_ref(), &user.uuid).await?;
+    let direct_url = backend::build_direct_vless_url(state.backend.as_ref(), &user.uuid).await?;
+    Ok(format!(
+        "🏠 Bridge (censored regions):\n<pre>{}</pre>\n\n🌍 Direct (abroad):\n<pre>{}</pre>",
+        bridge_url, direct_url
+    ))
 }
 
-/// Execute /vpn command: get AmneziaVPN vpn:// connection string for a user.
+/// Execute /vpn command: get both bridge and direct AmneziaVPN vpn:// connection strings for a user.
 async fn cmd_vpn(
     state: &BotState,
     name: &str,
 ) -> std::result::Result<String, crate::error::AppError> {
+    use crate::xray::client::generate_amnezia_url;
     let client = XrayApiClient::new(state.backend.as_ref());
     let users = client.list_users().await?;
 
@@ -780,14 +785,30 @@ async fn cmd_vpn(
         .find(|u| u.name == name)
         .ok_or_else(|| crate::error::AppError::Xray(format!("user '{}' not found", name)))?;
 
-    let vpn_url = backend::build_amnezia_url(state.backend.as_ref(), &user.uuid).await?;
+    // Bridge vpn:// config
+    let bridge = backend::read_bridge_params(state.backend.as_ref()).await?;
+    let bridge_params = crate::xray::types::VlessUrlParams {
+        uuid: user.uuid.clone(),
+        host: bridge.host,
+        port: bridge.port,
+        sni: bridge.sni,
+        public_key: bridge.public_key,
+        short_id: bridge.short_id,
+        path: bridge.path,
+    };
+    let bridge_vpn_url = generate_amnezia_url(&bridge_params);
+
+    // Direct vpn:// config
+    let direct_params = backend::build_vless_params(state.backend.as_ref(), &user.uuid).await?;
+    let direct_vpn_url = generate_amnezia_url(&direct_params);
+
     Ok(format!(
-        "\u{1f511} VPN config for {}:\n\n<pre>{}</pre>",
-        name, vpn_url
+        "🏠 Bridge VPN (censored regions):\n<pre>{}</pre>\n\n🌍 Direct VPN (abroad):\n<pre>{}</pre>",
+        bridge_vpn_url, direct_vpn_url
     ))
 }
 
-/// Execute /qr command: generate QR code PNGs for both vless:// and vpn:// URLs.
+/// Execute /qr command: generate QR code PNGs for bridge and direct vless:// URLs.
 async fn cmd_qr(
     state: &BotState,
     name: &str,
@@ -800,27 +821,23 @@ async fn cmd_qr(
         .find(|u| u.name == name)
         .ok_or_else(|| crate::error::AppError::Xray(format!("user '{}' not found", name)))?;
 
-    let params = backend::build_vless_params(state.backend.as_ref(), &user.uuid).await?;
-    let vless_url = crate::xray::client::generate_vless_url(&params);
-    let vpn_url = crate::xray::client::generate_amnezia_url(&params);
+    let bridge_url = backend::build_bridge_vless_url(state.backend.as_ref(), &user.uuid).await?;
+    let direct_url = backend::build_direct_vless_url(state.backend.as_ref(), &user.uuid).await?;
 
     let mut results = Vec::new();
 
-    let vless_png = render_qr_to_png(&vless_url, 8)
+    let bridge_png = render_qr_to_png(&bridge_url, 8)
         .map_err(|e| crate::error::AppError::Xray(format!("QR generation failed: {}", e)))?;
     results.push((
-        vless_png,
-        format!("\u{1f4f1} sing-box / v2rayN — {}", name),
+        bridge_png,
+        format!("🏠 Bridge (censored regions) — {}", name),
     ));
 
-    // AmneziaVPN QR contains raw base64url payload (without vpn:// prefix).
-    // The scanner base64-decodes, zlib-decompresses, and parses JSON directly.
-    let vpn_qr_data = vpn_url.strip_prefix("vpn://").unwrap_or(&vpn_url);
-    let vpn_png = render_qr_to_png(vpn_qr_data, 6)
+    let direct_png = render_qr_to_png(&direct_url, 8)
         .map_err(|e| crate::error::AppError::Xray(format!("QR generation failed: {}", e)))?;
     results.push((
-        vpn_png,
-        format!("\u{1f511} VPN config — {}", name),
+        direct_png,
+        format!("🌍 Direct (abroad) — {}", name),
     ));
 
     Ok(results)
@@ -1064,6 +1081,7 @@ async fn cmd_unroute(
 }
 
 /// Format the /url response: vless:// URL as a copyable message.
+#[allow(dead_code)]
 pub fn format_url_message(name: &str, vless_url: &str) -> String {
     format!("🔗 {} URL:\n\n<pre>{}</pre>", name, vless_url)
 }

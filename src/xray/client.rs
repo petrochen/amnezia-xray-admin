@@ -608,7 +608,7 @@ pub fn build_online_ip_list_cmd(email: &str) -> Result<String> {
 
 /// Generate a vless:// URL for client import.
 ///
-/// Format: `vless://<uuid>@<host>:<port>?encryption=none&type=grpc&serviceName=grpc&security=reality&sni=<sni>&fp=chrome&pbk=<pubkey>&sid=<shortid>#LT-Xray`
+/// Format: `vless://<uuid>@<host>:<port>?encryption=none&type=xhttp&path=<path>&security=reality&sni=<sni>&fp=chrome&pbk=<pubkey>&sid=<shortid>#LT-Xray`
 pub fn generate_vless_url(params: &VlessUrlParams) -> String {
     let fragment = urlencode_fragment("LT-Xray");
     // Wrap IPv6 addresses in brackets per RFC 2732
@@ -617,15 +617,17 @@ pub fn generate_vless_url(params: &VlessUrlParams) -> String {
     } else {
         params.host.clone()
     };
+    // URL-encode path (/ -> %2F)
+    let encoded_path = params.path.replace('/', "%2F");
     format!(
-        "vless://{}@{}:{}?encryption=none&type=grpc&serviceName=grpc&security=reality&sni={}&fp=chrome&pbk={}&sid={}#{}",
-        params.uuid, host, params.port, params.sni, params.public_key, params.short_id, fragment
+        "vless://{}@{}:{}?encryption=none&type=xhttp&path={}&security=reality&sni={}&fp=chrome&pbk={}&sid={}#{}",
+        params.uuid, host, params.port, encoded_path, params.sni, params.public_key, params.short_id, fragment
     )
 }
 
 /// Generate an AmneziaVPN `vpn://` connection string.
 ///
-/// The Amnezia format wraps a full Xray client JSON config inside a container
+/// The Amnezia format wraps a thin Xray client JSON config inside a container
 /// descriptor, then compresses with zlib and base64url-encodes it.
 pub fn generate_amnezia_url(params: &VlessUrlParams) -> String {
     use base64::Engine;
@@ -635,64 +637,37 @@ pub fn generate_amnezia_url(params: &VlessUrlParams) -> String {
 
     let xray_client_config = serde_json::json!({
         "log": { "loglevel": "error" },
-        "dns": {
-            "servers": [
-                { "address": "https+local://1.1.1.1/dns-query", "skipFallback": true },
-                { "address": "https+local://8.8.8.8/dns-query", "skipFallback": true },
-                "localhost"
-            ]
-        },
         "inbounds": [{
             "listen": "127.0.0.1",
             "port": 10808,
             "protocol": "socks",
-            "settings": { "udp": true },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": ["http", "tls", "quic"]
-            }
+            "settings": { "udp": true }
         }],
-        "outbounds": [
-            {
-                "protocol": "vless",
-                "settings": {
-                    "vnext": [{
-                        "address": params.host,
-                        "port": params.port,
-                        "users": [{
-                            "id": params.uuid,
-                            "encryption": "none"
-                        }]
+        "outbounds": [{
+            "protocol": "vless",
+            "settings": {
+                "vnext": [{
+                    "address": params.host,
+                    "port": params.port,
+                    "users": [{
+                        "id": params.uuid,
+                        "encryption": "none"
                     }]
-                },
-                "streamSettings": {
-                    "network": "grpc",
-                    "security": "reality",
-                    "grpcSettings": {
-                        "serviceName": "grpc"
-                    },
-                    "realitySettings": {
-                        "fingerprint": "chrome",
-                        "serverName": params.sni,
-                        "publicKey": params.public_key,
-                        "shortId": params.short_id,
-                        "spiderX": ""
-                    }
-                },
-                "tag": "proxy"
+                }]
             },
-            {
-                "protocol": "freedom",
-                "tag": "direct"
+            "streamSettings": {
+                "network": "xhttp",
+                "security": "reality",
+                "xhttpSettings": { "path": params.path },
+                "realitySettings": {
+                    "fingerprint": "chrome",
+                    "serverName": params.sni,
+                    "publicKey": params.public_key,
+                    "shortId": params.short_id,
+                    "spiderX": ""
+                }
             }
-        ],
-        "routing": {
-            "domainStrategy": "IPIfNonMatch",
-            "rules": [
-                { "type": "field", "outboundTag": "direct", "domain": ["geosite:private"] },
-                { "type": "field", "outboundTag": "proxy", "network": "tcp,udp" }
-            ]
-        }
+        }]
     });
 
     let amnezia_config = serde_json::json!({
@@ -701,7 +676,7 @@ pub fn generate_amnezia_url(params: &VlessUrlParams) -> String {
             "xray": {
                 "last_config": serde_json::to_string_pretty(&xray_client_config).unwrap() + "\n",
                 "port": params.port.to_string(),
-                "transport_proto": "tcp"
+                "transport_proto": "xhttp"
             }
         }],
         "defaultContainer": "amnezia-xray",
@@ -1395,13 +1370,16 @@ stat: {
             sni: "www.googletagmanager.com".to_string(),
             public_key: "testpublickey123".to_string(),
             short_id: "abcd1234".to_string(),
+            path: "/test".to_string(),
         };
         let url = generate_vless_url(&params);
 
         assert!(url.starts_with("vless://550e8400-e29b-41d4-a716-446655440000@1.2.3.4:443?"));
         assert!(url.contains("encryption=none"));
-        
-        assert!(url.contains("type=grpc"));
+        assert!(url.contains("type=xhttp"));
+        assert!(!url.contains("type=tcp"));
+        assert!(!url.contains("flow="));
+        assert!(url.contains("path="));
         assert!(url.contains("security=reality"));
         assert!(url.contains("sni=www.googletagmanager.com"));
         assert!(url.contains("fp=chrome"));
@@ -1419,8 +1397,9 @@ stat: {
             sni: "example.com".to_string(),
             public_key: "pk123".to_string(),
             short_id: "sid1".to_string(),
+            path: "/mypath".to_string(),
         };
-        let expected = "vless://uuid-123@10.0.0.1:8443?encryption=none&type=grpc&serviceName=grpc&security=reality&sni=example.com&fp=chrome&pbk=pk123&sid=sid1#LT-Xray";
+        let expected = "vless://uuid-123@10.0.0.1:8443?encryption=none&type=xhttp&path=%2Fmypath&security=reality&sni=example.com&fp=chrome&pbk=pk123&sid=sid1#LT-Xray";
         assert_eq!(generate_vless_url(&params), expected);
     }
 
@@ -1433,6 +1412,7 @@ stat: {
             sni: "example.com".to_string(),
             public_key: "pk".to_string(),
             short_id: "sid".to_string(),
+            path: "/".to_string(),
         };
         let url = generate_vless_url(&params);
         assert!(url.ends_with("#LT-Xray"));
@@ -1447,6 +1427,7 @@ stat: {
             sni: "example.com".to_string(),
             public_key: "pk".to_string(),
             short_id: "sid".to_string(),
+            path: "/".to_string(),
         };
         let url = generate_vless_url(&params);
         // Apostrophe is allowed in fragments
@@ -1462,9 +1443,26 @@ stat: {
             sni: "example.com".to_string(),
             public_key: "pk".to_string(),
             short_id: "sid".to_string(),
+            path: "/".to_string(),
         };
         let url = generate_vless_url(&params);
         assert!(url.contains("@[2001:db8::1]:443"));
+    }
+
+    #[test]
+    fn test_generate_vless_url_path_encoding() {
+        let params = VlessUrlParams {
+            uuid: "uuid-123".to_string(),
+            host: "1.2.3.4".to_string(),
+            port: 443,
+            sni: "example.com".to_string(),
+            public_key: "pk".to_string(),
+            short_id: "sid".to_string(),
+            path: "/abc123".to_string(),
+        };
+        let url = generate_vless_url(&params);
+        assert!(url.contains("path=%2Fabc123"));
+        assert!(!url.contains("flow="));
     }
 
     #[test]

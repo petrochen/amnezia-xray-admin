@@ -16,6 +16,18 @@ use crate::xray::types::{VlessUrlParams, XrayUser};
 
 /// Path to the Xray public key file on the server (used for vless:// URLs).
 const PUBLIC_KEY_PATH: &str = "/opt/amnezia/xray/xray_public.key";
+/// Path to bridge params JSON on the server (written by server setup scripts).
+const BRIDGE_PARAMS_PATH: &str = "/etc/xray/bridge-params.json";
+
+/// Bridge node parameters for double-hop XHTTP+Reality configuration.
+pub struct BridgeParams {
+    pub host: String,
+    pub port: u16,
+    pub public_key: String,
+    pub short_id: String,
+    pub sni: String,
+    pub path: String,
+}
 
 /// Why a vless URL was requested
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +203,46 @@ async fn read_public_key(backend: &dyn XrayBackend) -> Result<String, AppError> 
     }
 }
 
+/// Read bridge params JSON from the server host (not inside container).
+pub async fn read_bridge_params(backend: &dyn XrayBackend) -> Result<BridgeParams, AppError> {
+    let result = backend
+        .exec_on_host(&format!("cat {}", BRIDGE_PARAMS_PATH))
+        .await?;
+    if !result.success() {
+        return Err(AppError::Xray(format!(
+            "failed to read bridge params from {}: {}",
+            BRIDGE_PARAMS_PATH,
+            result.stderr.trim()
+        )));
+    }
+    let v: serde_json::Value = serde_json::from_str(result.stdout.trim())
+        .map_err(|e| AppError::Xray(format!("failed to parse bridge params: {}", e)))?;
+    let host = v["host"]
+        .as_str()
+        .ok_or_else(|| AppError::Xray("bridge-params.json missing 'host'".to_string()))?
+        .to_string();
+    let port = v["port"]
+        .as_u64()
+        .ok_or_else(|| AppError::Xray("bridge-params.json missing 'port'".to_string()))? as u16;
+    let public_key = v["publicKey"]
+        .as_str()
+        .ok_or_else(|| AppError::Xray("bridge-params.json missing 'publicKey'".to_string()))?
+        .to_string();
+    let short_id = v["shortId"]
+        .as_str()
+        .ok_or_else(|| AppError::Xray("bridge-params.json missing 'shortId'".to_string()))?
+        .to_string();
+    let sni = v["sni"]
+        .as_str()
+        .ok_or_else(|| AppError::Xray("bridge-params.json missing 'sni'".to_string()))?
+        .to_string();
+    let path = v["path"]
+        .as_str()
+        .ok_or_else(|| AppError::Xray("bridge-params.json missing 'path'".to_string()))?
+        .to_string();
+    Ok(BridgeParams { host, port, public_key, short_id, sni, path })
+}
+
 /// Build VlessUrlParams from live server config. Reused by vless:// and vpn:// generators.
 pub async fn build_vless_params(
     backend: &dyn XrayBackend,
@@ -203,6 +255,16 @@ pub async fn build_vless_params(
     let port = server_config.vless_port().unwrap_or(443);
     let public_key = read_public_key(backend).await?;
 
+    // Try to read xhttpSettings path from server config
+    let path = server_config
+        .find_vless_inbound()
+        .and_then(|ib| ib.get("streamSettings"))
+        .and_then(|ss| ss.get("xhttpSettings"))
+        .and_then(|xh| xh.get("path"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("/")
+        .to_string();
+
     Ok(VlessUrlParams {
         uuid: uuid.to_string(),
         host: backend.hostname().to_string(),
@@ -210,7 +272,35 @@ pub async fn build_vless_params(
         sni: reality.sni,
         public_key,
         short_id: reality.short_id,
+        path,
     })
+}
+
+/// Build a bridge vless:// URL for a user (via bridge node, for censored regions).
+pub async fn build_bridge_vless_url(
+    backend: &dyn XrayBackend,
+    uuid: &str,
+) -> Result<String, AppError> {
+    let bridge = read_bridge_params(backend).await?;
+    let params = VlessUrlParams {
+        uuid: uuid.to_string(),
+        host: bridge.host,
+        port: bridge.port,
+        sni: bridge.sni,
+        public_key: bridge.public_key,
+        short_id: bridge.short_id,
+        path: bridge.path,
+    };
+    Ok(generate_vless_url(&params))
+}
+
+/// Build a direct vless:// URL for a user (egress node, for abroad).
+pub async fn build_direct_vless_url(
+    backend: &dyn XrayBackend,
+    uuid: &str,
+) -> Result<String, AppError> {
+    let params = build_vless_params(backend, uuid).await?;
+    Ok(generate_vless_url(&params))
 }
 
 /// Build a vless:// URL for a user, using live server config for reality params.
@@ -223,6 +313,7 @@ pub async fn build_vless_url(
 }
 
 /// Build a vpn:// connection string for a user (compressed Xray config).
+#[allow(dead_code)]
 pub async fn build_amnezia_url(
     backend: &dyn XrayBackend,
     uuid: &str,

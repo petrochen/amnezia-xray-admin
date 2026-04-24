@@ -388,9 +388,11 @@ async fn cli_user_url(config: &Config, name: &str, local: bool) -> error::Result
         }
     };
 
-    let vless_url = backend::build_vless_url(backend.as_ref(), &user.uuid).await?;
+    let bridge_url = backend::build_bridge_vless_url(backend.as_ref(), &user.uuid).await?;
+    let direct_url = backend::build_direct_vless_url(backend.as_ref(), &user.uuid).await?;
 
-    println!("{}", vless_url);
+    println!("Bridge: {}", bridge_url);
+    println!("Direct: {}", direct_url);
     Ok(())
 }
 
@@ -430,6 +432,7 @@ async fn cli_user_qr(config: &Config, name: &str, local: bool) -> error::Result<
 }
 
 async fn cli_user_vpn(config: &Config, name: &str, local: bool) -> error::Result<()> {
+    use xray::client::generate_amnezia_url;
     let backend = connect_cli_backend(config, local).await?;
     let client = xray::client::XrayApiClient::new(backend.as_ref());
     let users = client.list_users().await?;
@@ -442,8 +445,25 @@ async fn cli_user_vpn(config: &Config, name: &str, local: bool) -> error::Result
         }
     };
 
-    let vpn_url = backend::build_amnezia_url(backend.as_ref(), &user.uuid).await?;
-    println!("{}", vpn_url);
+    // Bridge vpn:// config
+    let bridge = backend::read_bridge_params(backend.as_ref()).await?;
+    let bridge_params = xray::types::VlessUrlParams {
+        uuid: user.uuid.clone(),
+        host: bridge.host,
+        port: bridge.port,
+        sni: bridge.sni,
+        public_key: bridge.public_key,
+        short_id: bridge.short_id,
+        path: bridge.path,
+    };
+    let bridge_vpn = generate_amnezia_url(&bridge_params);
+
+    // Direct vpn:// config
+    let direct_params = backend::build_vless_params(backend.as_ref(), &user.uuid).await?;
+    let direct_vpn = generate_amnezia_url(&direct_params);
+
+    println!("Bridge: {}", bridge_vpn);
+    println!("Direct: {}", direct_vpn);
     Ok(())
 }
 
@@ -720,14 +740,11 @@ async fn cli_add_user(config: &Config, name: &str, local: bool) -> error::Result
     println!("Name:  {}", name);
     println!("UUID:  {}", uuid);
 
-    // URL generation is best-effort: if it fails, the user was still added successfully.
-    match backend::build_vless_params(backend.as_ref(), &uuid).await {
-        Ok(params) => {
-            println!("URL:   {}", xray::client::generate_vless_url(&params));
-            println!("VPN:   {}", xray::client::generate_amnezia_url(&params));
-        }
+    // Bridge URL generation is best-effort: if it fails, the user was still added successfully.
+    match backend::build_bridge_vless_url(backend.as_ref(), &uuid).await {
+        Ok(url) => println!("Bridge: {}", url),
         Err(e) => eprintln!(
-            "Warning: URL generation failed: {}. Use --user-url to retry.",
+            "Warning: bridge URL generation failed: {}. Use --user-url to retry.",
             e
         ),
     }
