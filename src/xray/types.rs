@@ -253,6 +253,7 @@ impl ServerConfig {
     ///
     /// Returns (user_email, outbound_tag) pairs for routing rules that have
     /// a `user` field (custom per-user routes, not system routes like api).
+    #[allow(dead_code)]
     pub fn list_user_routes(&self) -> Vec<(String, String)> {
         let mut routes = Vec::new();
         if let Some(routing) = self.raw.get("routing") {
@@ -278,6 +279,7 @@ impl ServerConfig {
     ///
     /// Creates a routing rule that matches the user's email and directs
     /// traffic to the specified outbound tag.
+    #[allow(dead_code)]
     pub fn add_user_route(&mut self, user: &str, outbound: &str) {
         let email = if user.contains('@') {
             user.to_string()
@@ -310,6 +312,7 @@ impl ServerConfig {
     /// Remove a per-user routing rule.
     ///
     /// Returns true if a rule was found and removed.
+    #[allow(dead_code)]
     pub fn remove_user_route(&mut self, user: &str) -> bool {
         let email = if user.contains('@') {
             user.to_string()

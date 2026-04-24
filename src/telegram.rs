@@ -28,8 +28,10 @@ pub struct BotState {
     pub config: Mutex<Config>,
 }
 
-/// Callback query prefix for URL inline buttons.
+/// Callback query prefix for URL/config inline buttons.
 const URL_PREFIX: &str = "url:";
+/// Callback query prefix for config inline buttons.
+const CONFIG_PREFIX: &str = "config:";
 /// Callback query prefix for QR inline buttons.
 const QR_PREFIX: &str = "qr:";
 /// Callback query prefix for delete user selection buttons.
@@ -40,8 +42,6 @@ const DELETE_CONFIRM_PREFIX: &str = "delete_confirm:";
 const DELETE_CANCEL_PREFIX: &str = "delete_cancel:";
 /// Callback query prefix for restore snapshot buttons.
 const RESTORE_PREFIX: &str = "restore:";
-/// Callback query prefix for VPN (Amnezia) inline buttons.
-const VPN_PREFIX: &str = "vpn:";
 /// Callback query prefix for upgrade confirmation buttons.
 const UPGRADE_CONFIRM_PREFIX: &str = "upgrade_confirm";
 /// Callback query prefix for upgrade cancel buttons.
@@ -57,39 +57,24 @@ pub enum Command {
     Help,
     #[command(description = "List users with stats")]
     Users,
-    #[command(description = "Server info + online users")]
+    #[command(description = "Server info")]
     Status,
-    #[command(description = "Add a new user: /add <name>")]
+    #[command(description = "Add user: /add <name>")]
     Add(String),
-    #[command(description = "Delete a user: /delete <name>")]
-    Delete(String),
-    #[command(description = "Get vless:// URL: /url <name>")]
-    Url(String),
+    #[command(description = "Delete user: /del <name>")]
+    Del(String),
+    #[command(description = "Get config: /config <name>")]
+    Config(String),
     #[command(description = "Get QR code: /qr <name>")]
     Qr(String),
-    #[command(description = "Full VPN config: /vpn <name>")]
-    Vpn(String),
-    /// Create server snapshot
-    #[command(description = "Create server snapshot")]
+    #[command(description = "Create snapshot")]
     Snapshot,
-    /// List snapshots
     #[command(description = "List snapshots")]
     Snapshots,
-    /// Restore from snapshot
-    #[command(description = "Restore from snapshot")]
+    #[command(description = "Restore snapshot")]
     Restore(String),
-    /// Upgrade Xray to latest
-    #[command(description = "Upgrade Xray to latest")]
+    #[command(description = "Upgrade Xray")]
     Upgrade,
-    /// Show routing rules
-    #[command(description = "Show routing rules")]
-    Routes,
-    /// Add route: /route user outbound
-    #[command(description = "Add route: /route user outbound")]
-    Route(String),
-    /// Remove route
-    #[command(description = "Remove route")]
-    Unroute(String),
 }
 
 /// Check if a chat ID matches the configured admin.
@@ -100,23 +85,15 @@ fn is_admin(config: &Config, chat_id: ChatId) -> bool {
 /// Format the /help response text.
 pub fn help_text() -> String {
     [
-        "Available commands:",
-        "/start - Show welcome message",
-        "/help - Show this help message",
-        "/users - List users with stats",
-        "/add <name> - Add a new user",
-        "/delete <name> - Delete a user",
-        "/url <name> - Get vless:// URL",
-        "/qr <name> - Get QR code image",
-        "/vpn <name> - Full VPN config",
-        "/status - Server info + online users",
-        "/snapshot - Create server snapshot",
-        "/snapshots - List snapshots",
-        "/restore [tag] - Restore from snapshot",
-        "/upgrade - Upgrade Xray to latest",
-        "/routes - Show routing rules",
-        "/route <user> <outbound> - Add route",
-        "/unroute <name> - Remove route",
+        "Commands:",
+        "/add <name> - Add user",
+        "/del <name> - Delete user",
+        "/config <name> - Get connection config",
+        "/qr <name> - Get QR code",
+        "/users - List users",
+        "/status - Server info",
+        "/snapshot - Create backup",
+        "/upgrade - Upgrade Xray",
     ]
     .join("\n")
 }
@@ -170,10 +147,10 @@ pub fn format_users_message(users: &[(XrayUser, TrafficStats, u32)]) -> String {
 }
 
 /// Format the /add success response.
-pub fn format_add_message(name: &str, uuid: &str, bridge_url: &str) -> String {
+pub fn format_add_message(name: &str, uuid: &str, bridge_url: &str, direct_url: &str) -> String {
     format!(
-        "✅ User '{}' added.\n\nUUID: {}\n\n🏠 Bridge (censored regions):\n<pre>{}</pre>",
-        name, uuid, bridge_url
+        "✅ User '{}' added.\n\nUUID: {}\n\n🏠 Для России:\n<pre>{}</pre>\n\n✈️ Из-за рубежа:\n<pre>{}</pre>",
+        name, uuid, bridge_url, direct_url
     )
 }
 
@@ -449,14 +426,14 @@ async fn handle_command(
                     .await?;
             }
         }
-        Command::Delete(name) => {
+        Command::Del(name) => {
             let name = name.trim().to_string();
             if name.is_empty() {
                 match cmd_user_keyboard(&state, DELETE_PREFIX).await {
                     Ok(result) => {
                         if result.keyboard.inline_keyboard.is_empty() {
                             let msg = format_empty_keyboard_message(
-                                "/delete <name>",
+                                "/del <name>",
                                 &result.skipped_names,
                                 result.unnamed_count,
                             );
@@ -489,14 +466,14 @@ async fn handle_command(
                 }
             }
         }
-        Command::Url(name) => {
+        Command::Config(name) => {
             let name = name.trim().to_string();
             if name.is_empty() {
-                match cmd_user_keyboard(&state, URL_PREFIX).await {
+                match cmd_user_keyboard(&state, CONFIG_PREFIX).await {
                     Ok(result) => {
                         if result.keyboard.inline_keyboard.is_empty() {
                             let msg = format_empty_keyboard_message(
-                                "/url <name>",
+                                "/config <name>",
                                 &result.skipped_names,
                                 result.unnamed_count,
                             );
@@ -517,7 +494,7 @@ async fn handle_command(
                     }
                 }
             } else {
-                let text = match cmd_url(&state, &name).await {
+                let text = match cmd_config(&state, &name).await {
                     Ok(t) => t,
                     Err(e) => format!("Error: {}", e),
                 };
@@ -567,43 +544,6 @@ async fn handle_command(
                 }
             }
         }
-        Command::Vpn(name) => {
-            let name = name.trim().to_string();
-            if name.is_empty() {
-                match cmd_user_keyboard(&state, VPN_PREFIX).await {
-                    Ok(result) => {
-                        if result.keyboard.inline_keyboard.is_empty() {
-                            let msg = format_empty_keyboard_message(
-                                "/vpn <name>",
-                                &result.skipped_names,
-                                result.unnamed_count,
-                            );
-                            bot.send_message(chat_id, msg).await?;
-                        } else {
-                            let msg = format_selection_message(
-                                "Select a user:",
-                                &result.skipped_names,
-                                result.unnamed_count,
-                            );
-                            bot.send_message(chat_id, msg)
-                                .reply_markup(result.keyboard)
-                                .await?;
-                        }
-                    }
-                    Err(e) => {
-                        bot.send_message(chat_id, format!("Error: {}", e)).await?;
-                    }
-                }
-            } else {
-                let text = match cmd_vpn(&state, &name).await {
-                    Ok(t) => t,
-                    Err(e) => format!("Error: {}", e),
-                };
-                bot.send_message(chat_id, text)
-                    .parse_mode(ParseMode::Html)
-                    .await?;
-            }
-        }
         Command::Snapshot => {
             match cmd_snapshot(&bot, chat_id, &state).await {
                 Ok(()) => {} // message already sent inside
@@ -651,27 +591,6 @@ async fn handle_command(
                 }
             }
         }
-        Command::Routes => {
-            let text = match cmd_routes(&state).await {
-                Ok(t) => t,
-                Err(e) => format!("Error: {}", e),
-            };
-            bot.send_message(chat_id, text).await?;
-        }
-        Command::Route(args) => {
-            let text = match cmd_route(&state, &args).await {
-                Ok(t) => t,
-                Err(e) => format!("Error: {}", e),
-            };
-            bot.send_message(chat_id, text).await?;
-        }
-        Command::Unroute(name) => {
-            let text = match cmd_unroute(&state, &name).await {
-                Ok(t) => t,
-                Err(e) => format!("Error: {}", e),
-            };
-            bot.send_message(chat_id, text).await?;
-        }
     }
 
     Ok(())
@@ -692,7 +611,7 @@ async fn cmd_users(state: &BotState) -> std::result::Result<String, crate::error
     Ok(format_users_message(&user_data))
 }
 
-/// Execute /add command: add a user, return UUID + bridge URL.
+/// Execute /add command: add a user, return UUID + bridge + direct URLs.
 async fn cmd_add(
     state: &BotState,
     name: &str,
@@ -700,7 +619,8 @@ async fn cmd_add(
     let client = XrayApiClient::new(state.backend.as_ref());
     let uuid = client.add_user(name).await?;
     let bridge_url = backend::build_bridge_vless_url(state.backend.as_ref(), &uuid).await?;
-    Ok(format_add_message(name, &uuid, &bridge_url))
+    let direct_url = backend::build_direct_vless_url(state.backend.as_ref(), &uuid).await?;
+    Ok(format_add_message(name, &uuid, &bridge_url, &direct_url))
 }
 
 /// Execute /delete prompt: find user and return confirmation message with inline keyboard.
@@ -750,8 +670,8 @@ async fn cmd_user_keyboard(
     Ok(build_user_keyboard(&users, callback_prefix))
 }
 
-/// Execute /url command: get both bridge and direct vless:// URLs for a user.
-async fn cmd_url(
+/// Execute /config command: get both bridge and direct vless:// URLs for a user.
+async fn cmd_config(
     state: &BotState,
     name: &str,
 ) -> std::result::Result<String, crate::error::AppError> {
@@ -766,45 +686,8 @@ async fn cmd_url(
     let bridge_url = backend::build_bridge_vless_url(state.backend.as_ref(), &user.uuid).await?;
     let direct_url = backend::build_direct_vless_url(state.backend.as_ref(), &user.uuid).await?;
     Ok(format!(
-        "🏠 Bridge (censored regions):\n<pre>{}</pre>\n\n🌍 Direct (abroad):\n<pre>{}</pre>",
+        "🏠 Для России:\n<pre>{}</pre>\n\n✈️ Из-за рубежа:\n<pre>{}</pre>",
         bridge_url, direct_url
-    ))
-}
-
-/// Execute /vpn command: get both bridge and direct AmneziaVPN vpn:// connection strings for a user.
-async fn cmd_vpn(
-    state: &BotState,
-    name: &str,
-) -> std::result::Result<String, crate::error::AppError> {
-    use crate::xray::client::generate_amnezia_url;
-    let client = XrayApiClient::new(state.backend.as_ref());
-    let users = client.list_users().await?;
-
-    let user = users
-        .iter()
-        .find(|u| u.name == name)
-        .ok_or_else(|| crate::error::AppError::Xray(format!("user '{}' not found", name)))?;
-
-    // Bridge vpn:// config
-    let bridge = backend::read_bridge_params(state.backend.as_ref()).await?;
-    let bridge_params = crate::xray::types::VlessUrlParams {
-        uuid: user.uuid.clone(),
-        host: bridge.host,
-        port: bridge.port,
-        sni: bridge.sni,
-        public_key: bridge.public_key,
-        short_id: bridge.short_id,
-        path: bridge.path,
-    };
-    let bridge_vpn_url = generate_amnezia_url(&bridge_params);
-
-    // Direct vpn:// config
-    let direct_params = backend::build_vless_params(state.backend.as_ref(), &user.uuid).await?;
-    let direct_vpn_url = generate_amnezia_url(&direct_params);
-
-    Ok(format!(
-        "🏠 Bridge VPN (censored regions):\n<pre>{}</pre>\n\n🌍 Direct VPN (abroad):\n<pre>{}</pre>",
-        bridge_vpn_url, direct_vpn_url
     ))
 }
 
@@ -1020,66 +903,6 @@ async fn cmd_upgrade_execute(
     Ok(())
 }
 
-/// Execute /routes command: show routing rules from server config.
-async fn cmd_routes(state: &BotState) -> std::result::Result<String, crate::error::AppError> {
-    let config = crate::xray::config::read_server_config(state.backend.as_ref()).await?;
-    let routes = config.list_user_routes();
-
-    if routes.is_empty() {
-        return Ok("No custom routing rules found.".to_string());
-    }
-
-    let mut lines = Vec::new();
-    lines.push("\u{1f6e3}\u{fe0f} Routing rules:".to_string());
-    lines.push(String::new());
-    for (user, outbound) in &routes {
-        lines.push(format!("  {} \u{2192} {}", user, outbound));
-    }
-    Ok(lines.join("\n"))
-}
-
-/// Execute /route command: add a routing rule for a user.
-async fn cmd_route(
-    state: &BotState,
-    args: &str,
-) -> std::result::Result<String, crate::error::AppError> {
-    let parts: Vec<&str> = args.trim().splitn(2, ' ').collect();
-    if parts.len() < 2 {
-        return Ok("Usage: /route <user> <outbound>".to_string());
-    }
-    let user = parts[0].trim();
-    let outbound = parts[1].trim();
-
-    let mut config = crate::xray::config::read_server_config(state.backend.as_ref()).await?;
-    config.add_user_route(user, outbound);
-    crate::xray::config::upload_and_restart(state.backend.as_ref(), &config).await?;
-
-    Ok(format!(
-        "\u{2705} Route added: {} \u{2192} {}",
-        user, outbound
-    ))
-}
-
-/// Execute /unroute command: remove a routing rule.
-async fn cmd_unroute(
-    state: &BotState,
-    name: &str,
-) -> std::result::Result<String, crate::error::AppError> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Ok("Usage: /unroute <user>".to_string());
-    }
-
-    let mut config = crate::xray::config::read_server_config(state.backend.as_ref()).await?;
-    let removed = config.remove_user_route(name);
-    if !removed {
-        return Ok(format!("No route found for '{}'.", name));
-    }
-    crate::xray::config::upload_and_restart(state.backend.as_ref(), &config).await?;
-
-    Ok(format!("\u{2705} Route removed for '{}'.", name))
-}
-
 /// Format the /url response: vless:// URL as a copyable message.
 #[allow(dead_code)]
 pub fn format_url_message(name: &str, vless_url: &str) -> String {
@@ -1112,8 +935,8 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<BotState>) -> Re
         }
     }
 
-    if let Some(user_name) = data.strip_prefix(VPN_PREFIX) {
-        let text = match cmd_vpn(&state, user_name).await {
+    if let Some(user_name) = data.strip_prefix(CONFIG_PREFIX) {
+        let text = match cmd_config(&state, user_name).await {
             Ok(t) => t,
             Err(e) => format!("Error: {}", e),
         };
@@ -1124,7 +947,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<BotState>) -> Re
                 .await?;
         }
     } else if let Some(user_name) = data.strip_prefix(URL_PREFIX) {
-        let text = match cmd_url(&state, user_name).await {
+        let text = match cmd_config(&state, user_name).await {
             Ok(t) => t,
             Err(e) => format!("Error: {}", e),
         };
@@ -1316,14 +1139,14 @@ mod tests {
     #[test]
     fn test_help_text_contains_all_commands() {
         let text = help_text();
-        assert!(text.contains("/start"));
-        assert!(text.contains("/help"));
-        assert!(text.contains("/users"));
         assert!(text.contains("/add"));
-        assert!(text.contains("/delete"));
-        assert!(text.contains("/url"));
+        assert!(text.contains("/del"));
+        assert!(text.contains("/config"));
         assert!(text.contains("/qr"));
+        assert!(text.contains("/users"));
         assert!(text.contains("/status"));
+        assert!(text.contains("/snapshot"));
+        assert!(text.contains("/upgrade"));
     }
 
     #[test]
@@ -1378,11 +1201,8 @@ mod tests {
             descriptions
         );
         assert!(descriptions.contains("add"), "commands: {}", descriptions);
-        assert!(
-            descriptions.contains("delete"),
-            "commands: {}",
-            descriptions
-        );
+        assert!(descriptions.contains("del"), "commands: {}", descriptions);
+        assert!(descriptions.contains("config"), "commands: {}", descriptions);
     }
 
     #[test]
@@ -1528,17 +1348,20 @@ mod tests {
         let text = format_add_message(
             "Alice",
             "uuid-123",
-            "vless://uuid-123@1.2.3.4:443?...",
+            "vless://uuid-123@bridge:443?...",
+            "vless://uuid-123@direct:443?...",
         );
         assert!(text.contains("Alice"), "text: {}", text);
         assert!(text.contains("uuid-123"), "text: {}", text);
         assert!(text.contains("vless://"), "text: {}", text);
         assert!(text.contains("✅"), "text: {}", text);
+        assert!(text.contains("Для России"), "text: {}", text);
+        assert!(text.contains("Из-за рубежа"), "text: {}", text);
     }
 
     #[test]
     fn test_format_add_message_special_name() {
-        let text = format_add_message("Bob's Phone [iOS]", "uuid-456", "vless://...");
+        let text = format_add_message("Bob's Phone [iOS]", "uuid-456", "vless://bridge...", "vless://direct...");
         assert!(text.contains("Bob's Phone [iOS]"), "text: {}", text);
     }
 
@@ -1654,14 +1477,14 @@ mod tests {
     }
 
     #[test]
-    fn test_bot_commands_include_url_and_qr() {
+    fn test_bot_commands_include_config_and_qr() {
         let cmds = Command::bot_commands();
         let descriptions: String = cmds
             .iter()
             .map(|c| c.command.as_str())
             .collect::<Vec<_>>()
             .join(",");
-        assert!(descriptions.contains("url"), "commands: {}", descriptions);
+        assert!(descriptions.contains("config"), "commands: {}", descriptions);
         assert!(descriptions.contains("qr"), "commands: {}", descriptions);
     }
 
