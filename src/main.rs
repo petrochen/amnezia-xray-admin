@@ -3,6 +3,7 @@ mod backend;
 mod backend_trait;
 mod config;
 mod error;
+mod http_agent;
 mod ssh;
 mod telegram;
 mod ui;
@@ -122,6 +123,19 @@ fn main() {
         }
         if let Err(e) = runtime.block_on(cli_telegram_bot(&config, &token, local)) {
             eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if cli.http_agent {
+        let secret = cli.secret.unwrap_or_else(|| {
+            eprintln!("Error: --secret is required with --http-agent");
+            std::process::exit(1);
+        });
+        let container = config.container.clone();
+        if let Err(e) = runtime.block_on(http_agent::run_agent(cli.agent_port, secret, container)) {
+            eprintln!("Agent error: {}", e);
             std::process::exit(1);
         }
         return;

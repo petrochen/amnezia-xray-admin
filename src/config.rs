@@ -175,6 +175,18 @@ pub struct Cli {
     /// Host directory for storing snapshots (default: /data/projects/xray-backup)
     #[arg(long = "snapshot-dir")]
     pub snapshot_dir: Option<String>,
+
+    /// Run as HTTP agent (bridge stats/management API)
+    #[arg(long = "http-agent")]
+    pub http_agent: bool,
+
+    /// Secret key for HTTP agent authentication (required with --http-agent)
+    #[arg(long = "secret")]
+    pub secret: Option<String>,
+
+    /// HTTP agent listen port (default: 9090)
+    #[arg(long = "agent-port", default_value = "9090")]
+    pub agent_port: u16,
 }
 
 /// Application configuration
@@ -500,6 +512,9 @@ host = "10.0.0.1"
             snapshot_list: false,
             upgrade_xray: false,
             snapshot_dir: None,
+            http_agent: false,
+            secret: None,
+            agent_port: 9090,
         };
         config.merge_cli(&cli);
 
@@ -555,6 +570,9 @@ host = "10.0.0.1"
             snapshot_list: false,
             upgrade_xray: false,
             snapshot_dir: None,
+            http_agent: false,
+            secret: None,
+            agent_port: 9090,
         };
         config.merge_cli(&cli);
 
@@ -599,6 +617,9 @@ host = "10.0.0.1"
             snapshot_list: false,
             upgrade_xray: false,
             snapshot_dir: None,
+            http_agent: false,
+            secret: None,
+            agent_port: 9090,
         };
         config.merge_cli(&cli);
         assert_eq!(config, Config::default());
