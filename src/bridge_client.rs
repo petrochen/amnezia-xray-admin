@@ -2,9 +2,6 @@
 //!
 //! Uses only std::net::TcpStream — no external HTTP dependencies.
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::time::Duration;
 
 pub struct BridgeClient {
     base_url: String, // e.g. "http://51.250.73.78:9090/secret-key"

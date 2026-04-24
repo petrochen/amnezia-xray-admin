@@ -153,15 +153,20 @@ pub fn format_users_message_with_bridge(
     users: &[(XrayUser, TrafficStats, u32)],
     bridge_stats: &[(String, u64, u64)],
 ) -> String {
-    if users.is_empty() {
-        return "No users found.".to_string();
-    }
-
     let mut lines = Vec::new();
     lines.push("👥 Users:".to_string());
     lines.push(String::new());
 
+    // Collect all known emails from both sources
+    let mut seen_emails: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // First: egress users (with bridge stats merged)
     for (user, stats, online_count) in users {
+        seen_emails.insert(user.email.clone());
+        // Skip bridge@vpn — it's the aggregate, not a real user
+        if user.email == "bridge@vpn" {
+            continue;
+        }
         let name = if user.name.is_empty() {
             &user.uuid[..std::cmp::min(8, user.uuid.len())]
         } else {
@@ -173,29 +178,54 @@ pub fn format_users_message_with_bridge(
             "⚪".to_string()
         };
 
-        // Look up bridge stats by email
-        let bridge_suffix = bridge_stats
+        let bridge = bridge_stats
             .iter()
-            .find(|(email, _, _)| email == &user.email)
-            .map(|(_, up, down)| {
-                format!(
-                    " [bridge ↑{} ↓{}]",
-                    format_bytes(*up),
-                    format_bytes(*down)
-                )
-            })
-            .unwrap_or_default();
+            .find(|(email, _, _)| email == &user.email);
+        let has_direct = stats.uplink > 0 || stats.downlink > 0;
+        let has_bridge = bridge.is_some();
 
+        let traffic = if let Some((_, bup, bdown)) = bridge {
+            // Show bridge traffic (primary for RU users)
+            format!("↑{} ↓{}", format_bytes(*bup), format_bytes(*bdown))
+        } else if has_direct {
+            format!("↑{} ↓{}", format_bytes(stats.uplink), format_bytes(stats.downlink))
+        } else {
+            "—".to_string()
+        };
+
+        let servers = match (has_bridge, has_direct) {
+            (true, true) => " 🌐",
+            (true, false) => " 🏠",
+            (false, true) => " ✈️",
+            (false, false) => "",
+        };
+
+        lines.push(format!("{} {}: {}{}", online_indicator, name, traffic, servers));
+    }
+
+    // Second: bridge-only users (not on egress)
+    for (email, up, down) in bridge_stats {
+        if seen_emails.contains(email) {
+            continue;
+        }
+        let name = email.strip_suffix("@vpn").unwrap_or(email);
+        if name == "bridge" {
+            continue;
+        }
         lines.push(format!(
-            "{} {} ↑{} ↓{}{}",
-            online_indicator,
+            "⚪ {}: ↑{} ↓{} 🏠",
             name,
-            format_bytes(stats.uplink),
-            format_bytes(stats.downlink),
-            bridge_suffix,
+            format_bytes(*up),
+            format_bytes(*down),
         ));
     }
 
+    if lines.len() <= 2 {
+        return "No users found.".to_string();
+    }
+
+    lines.push(String::new());
+    lines.push("🏠 bridge  ✈️ direct  🌐 both".to_string());
     lines.join("\n")
 }
 
