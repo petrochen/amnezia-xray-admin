@@ -1,6 +1,7 @@
 mod app;
 mod backend;
 mod backend_trait;
+mod bridge_client;
 mod config;
 mod error;
 mod http_agent;
@@ -648,6 +649,38 @@ async fn cli_list_users(config: &Config, local: bool) -> error::Result<()> {
         );
     }
 
+    // Show bridge stats if bridge agent is configured
+    if let Some(ref agent_url) = config.bridge_agent_url {
+        let agent = bridge_client::BridgeClient::new(agent_url.clone());
+        match agent.get_stats() {
+            Ok(json) => {
+                let bridge_stats = bridge_client::parse_bridge_stats(&json);
+                if !bridge_stats.is_empty() {
+                    println!();
+                    println!("Bridge traffic:");
+                    println!(
+                        "{:<35} {:<12} {:<12}",
+                        "EMAIL", "BRIDGE UP", "BRIDGE DOWN"
+                    );
+                    println!("{}", "-".repeat(59));
+                    let mut sorted = bridge_stats;
+                    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                    for (email, up, down) in &sorted {
+                        println!(
+                            "{:<35} {:<12} {:<12}",
+                            email,
+                            ui::dashboard::format_bytes(*up),
+                            ui::dashboard::format_bytes(*down),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Bridge agent unavailable: {}", e);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -763,6 +796,15 @@ async fn cli_add_user(config: &Config, name: &str, local: bool) -> error::Result
         ),
     }
 
+    // Also register on bridge agent if configured
+    if let Some(ref agent_url) = config.bridge_agent_url {
+        let email = xray::types::XrayUser::email_from_name(name);
+        let agent = bridge_client::BridgeClient::new(agent_url.clone());
+        if let Err(e) = agent.add_user(&uuid, &email) {
+            eprintln!("Warning: failed to add user to bridge agent: {}", e);
+        }
+    }
+
     Ok(())
 }
 
@@ -801,6 +843,12 @@ async fn cli_delete_user(config: &Config, name: &str, local: bool, yes: bool) ->
 
     client.remove_user(&user.uuid).await?;
     println!("User '{}' deleted.", name);
+
+    // Also remove from bridge agent if configured
+    if let Some(ref agent_url) = config.bridge_agent_url {
+        let agent = bridge_client::BridgeClient::new(agent_url.clone());
+        let _ = agent.del_user(&user.email);
+    }
 
     Ok(())
 }

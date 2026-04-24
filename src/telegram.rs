@@ -146,6 +146,59 @@ pub fn format_users_message(users: &[(XrayUser, TrafficStats, u32)]) -> String {
     lines.join("\n")
 }
 
+/// Format the /users response annotated with bridge traffic stats.
+///
+/// Each user line shows egress stats plus bridge stats (if available for that user).
+pub fn format_users_message_with_bridge(
+    users: &[(XrayUser, TrafficStats, u32)],
+    bridge_stats: &[(String, u64, u64)],
+) -> String {
+    if users.is_empty() {
+        return "No users found.".to_string();
+    }
+
+    let mut lines = Vec::new();
+    lines.push("👥 Users:".to_string());
+    lines.push(String::new());
+
+    for (user, stats, online_count) in users {
+        let name = if user.name.is_empty() {
+            &user.uuid[..std::cmp::min(8, user.uuid.len())]
+        } else {
+            &user.name
+        };
+        let online_indicator = if *online_count > 0 {
+            format!("🟢 {}", online_count)
+        } else {
+            "⚪".to_string()
+        };
+
+        // Look up bridge stats by email
+        let bridge_suffix = bridge_stats
+            .iter()
+            .find(|(email, _, _)| email == &user.email)
+            .map(|(_, up, down)| {
+                format!(
+                    " [bridge ↑{} ↓{}]",
+                    format_bytes(*up),
+                    format_bytes(*down)
+                )
+            })
+            .unwrap_or_default();
+
+        lines.push(format!(
+            "{} {} ↑{} ↓{}{}",
+            online_indicator,
+            name,
+            format_bytes(stats.uplink),
+            format_bytes(stats.downlink),
+            bridge_suffix,
+        ));
+    }
+
+    lines.join("\n")
+}
+
 /// Format the /add success response.
 pub fn format_add_message(name: &str, uuid: &str, bridge_url: &str, direct_url: &str) -> String {
     format!(
@@ -596,7 +649,7 @@ async fn handle_command(
     Ok(())
 }
 
-/// Execute /users command: list users with stats.
+/// Execute /users command: list users with stats, optionally annotated with bridge traffic.
 async fn cmd_users(state: &BotState) -> std::result::Result<String, crate::error::AppError> {
     let client = XrayApiClient::new(state.backend.as_ref());
     let users = client.list_users().await?;
@@ -606,6 +659,16 @@ async fn cmd_users(state: &BotState) -> std::result::Result<String, crate::error
         let stats = client.get_user_stats(&user.email).await.unwrap_or_default();
         let online = client.get_online_count(&user.email).await.unwrap_or(0);
         user_data.push((user, stats, online));
+    }
+
+    // Fetch bridge stats if configured and annotate the output
+    let bridge_url = state.config.lock().await.bridge_agent_url.clone();
+    if let Some(url) = bridge_url {
+        let bridge_client = crate::bridge_client::BridgeClient::new(url);
+        if let Ok(json) = bridge_client.get_stats() {
+            let bridge_stats = crate::bridge_client::parse_bridge_stats(&json);
+            return Ok(format_users_message_with_bridge(&user_data, &bridge_stats));
+        }
     }
 
     Ok(format_users_message(&user_data))
@@ -620,6 +683,18 @@ async fn cmd_add(
     let uuid = client.add_user(name).await?;
     let bridge_url = backend::build_bridge_vless_url(state.backend.as_ref(), &uuid).await?;
     let direct_url = backend::build_direct_vless_url(state.backend.as_ref(), &uuid).await?;
+
+    // Also register user on bridge agent if configured
+    let bridge_agent_url = state.config.lock().await.bridge_agent_url.clone();
+    if let Some(agent_url) = bridge_agent_url {
+        let email = XrayUser::email_from_name(name);
+        let agent = crate::bridge_client::BridgeClient::new(agent_url);
+        if let Err(e) = agent.add_user(&uuid, &email) {
+            log::warn!("Failed to add user '{}' to bridge agent: {}", name, e);
+            // Non-fatal: user is already added to egress
+        }
+    }
+
     Ok(format_add_message(name, &uuid, &bridge_url, &direct_url))
 }
 
@@ -648,15 +723,26 @@ async fn cmd_delete_execute(
 ) -> std::result::Result<String, crate::error::AppError> {
     let client = XrayApiClient::new(state.backend.as_ref());
 
-    // Look up user name before deletion for the response message
+    // Look up user name and email before deletion for the response message and bridge call
     let users = client.list_users().await?;
-    let name = users
+    let (name, email) = users
         .iter()
         .find(|u| u.uuid == uuid)
-        .map(|u| u.name.clone())
-        .unwrap_or_else(|| uuid[..std::cmp::min(8, uuid.len())].to_string());
+        .map(|u| (u.name.clone(), u.email.clone()))
+        .unwrap_or_else(|| {
+            let short = uuid[..std::cmp::min(8, uuid.len())].to_string();
+            (short.clone(), short)
+        });
 
     client.remove_user(uuid).await?;
+
+    // Also remove from bridge agent if configured
+    let bridge_agent_url = state.config.lock().await.bridge_agent_url.clone();
+    if let Some(agent_url) = bridge_agent_url {
+        let agent = crate::bridge_client::BridgeClient::new(agent_url);
+        let _ = agent.del_user(&email);
+    }
+
     Ok(format_delete_success_message(&name))
 }
 
@@ -1046,7 +1132,7 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<BotState>) -> Re
     Ok(())
 }
 
-/// Execute /status command: server info + online summary.
+/// Execute /status command: server info + online summary + optional bridge health.
 async fn cmd_status(state: &BotState) -> std::result::Result<String, crate::error::AppError> {
     let client = XrayApiClient::new(state.backend.as_ref());
     let server_info = client.get_server_info().await?;
@@ -1061,13 +1147,27 @@ async fn cmd_status(state: &BotState) -> std::result::Result<String, crate::erro
     let uptime = crate::backend::fetch_container_uptime(state.backend.as_ref()).await;
     let latest_version = crate::backend::fetch_latest_xray_version(state.backend.as_ref()).await;
 
-    Ok(format_status_message(
+    let mut text = format_status_message(
         &server_info,
         users.len(),
         online_total,
         &uptime,
         latest_version.as_deref(),
-    ))
+    );
+
+    // Append bridge agent health status if configured
+    let bridge_agent_url = state.config.lock().await.bridge_agent_url.clone();
+    if let Some(agent_url) = bridge_agent_url {
+        let agent = crate::bridge_client::BridgeClient::new(agent_url);
+        let bridge_status = match agent.health() {
+            Ok(true) => "Bridge: ✅ online",
+            _ => "Bridge: ❌ offline",
+        };
+        text.push('\n');
+        text.push_str(bridge_status);
+    }
+
+    Ok(text)
 }
 
 /// Start the Telegram bot and block until shutdown.

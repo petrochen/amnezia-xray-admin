@@ -1,5 +1,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
+use std::time::Duration;
 
 pub async fn run_agent(
     port: u16,
@@ -11,183 +12,121 @@ pub async fn run_agent(
     log::info!("HTTP agent listening on {}", addr);
 
     for stream in listener.incoming() {
-        let mut stream = stream?;
-        let mut reader = BufReader::new(&stream);
-        let mut request_line = String::new();
-        reader.read_line(&mut request_line)?;
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Set timeouts to prevent blocking the single thread
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .ok();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .ok();
 
-        // Parse: GET /<secret>/stats HTTP/1.1
-        let parts: Vec<&str> = request_line.split_whitespace().collect();
-        if parts.len() < 2 {
-            send_response(&mut stream, 400, "Bad Request");
-            continue;
+        let secret = secret.clone();
+        let container = container.clone();
+
+        std::thread::spawn(move || {
+            if let Err(e) = handle_connection(&mut stream, &secret, &container) {
+                log::warn!("connection error: {}", e);
+            }
+        });
+    }
+    Ok(())
+}
+
+fn handle_connection(
+    stream: &mut std::net::TcpStream,
+    secret: &str,
+    container: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let reader_stream = stream.try_clone()?;
+    let mut reader = BufReader::new(reader_stream);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        send_response(stream, 400, "Bad Request");
+        return Ok(());
+    }
+
+    let method = parts[0].to_string();
+    let path = parts[1].to_string();
+
+    // Read and discard remaining headers
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            Err(_) => break,
         }
+    }
 
-        let method = parts[0];
-        let path = parts[1];
+    let expected_prefix = format!("/{}", secret);
+    if !path.starts_with(&expected_prefix) {
+        send_response(stream, 404, "Not Found");
+        return Ok(());
+    }
 
-        // Read and discard remaining headers
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-            if line.trim().is_empty() {
-                break;
+    let action = &path[expected_prefix.len()..];
+
+    match (method.as_str(), action) {
+        ("GET", "/health") => {
+            send_json(stream, 200, r#"{"ok":true}"#);
+        }
+        ("GET", "/stats") => {
+            let output = std::process::Command::new("docker")
+                .args([
+                    "exec", container, "xray", "api", "statsquery", "-s",
+                    "127.0.0.1:8080", "-pattern", "user>>>",
+                ])
+                .output();
+            match output {
+                Ok(o) => send_json(stream, 200, &String::from_utf8_lossy(&o.stdout)),
+                Err(e) => send_json(stream, 500, &format!(r#"{{"error":"{}"}}"#, e)),
             }
         }
-
-        // Auth check
-        let expected_prefix = format!("/{}", secret);
-        if !path.starts_with(&expected_prefix) {
-            send_response(&mut stream, 404, "Not Found");
-            continue;
+        ("POST", action) if action.starts_with("/add-user/") => {
+            let remainder = action.trim_start_matches("/add-user/");
+            let parts: Vec<&str> = remainder.splitn(2, '/').collect();
+            if parts.len() != 2 {
+                send_json(stream, 400, r#"{"error":"usage: /add-user/<uuid>/<email>"}"#);
+                return Ok(());
+            }
+            let (uuid, email) = (parts[0], parts[1]);
+            let adu_json = format!(
+                r#"{{"inboundTag":"client-in","user":{{"email":"{}","level":0,"account":{{"id":"{}","encryption":"none"}}}}}}"#,
+                email, uuid
+            );
+            let output = std::process::Command::new("docker")
+                .args(["exec", container, "xray", "api", "adu", "-s", "127.0.0.1:8080", &adu_json])
+                .output();
+            match output {
+                Ok(o) if o.status.success() => send_json(stream, 200, r#"{"ok":true}"#),
+                Ok(o) => send_json(stream, 500, &format!(r#"{{"error":"{}"}}"#, String::from_utf8_lossy(&o.stderr).trim())),
+                Err(e) => send_json(stream, 500, &format!(r#"{{"error":"{}"}}"#, e)),
+            }
         }
-
-        let action = &path[expected_prefix.len()..];
-
-        match (method, action) {
-            ("GET", "/health") => {
-                send_json(&mut stream, 200, r#"{"ok":true}"#);
+        ("POST", action) if action.starts_with("/del-user/") => {
+            let email = action.trim_start_matches("/del-user/");
+            let output = std::process::Command::new("docker")
+                .args(["exec", container, "xray", "api", "rmu", "-s", "127.0.0.1:8080", "-tag=client-in", email])
+                .output();
+            match output {
+                Ok(o) if o.status.success() => send_json(stream, 200, r#"{"ok":true}"#),
+                Ok(o) => send_json(stream, 500, &format!(r#"{{"error":"{}"}}"#, String::from_utf8_lossy(&o.stderr).trim())),
+                Err(e) => send_json(stream, 500, &format!(r#"{{"error":"{}"}}"#, e)),
             }
-            ("GET", "/stats") => {
-                let output = std::process::Command::new("docker")
-                    .args([
-                        "exec",
-                        &container,
-                        "xray",
-                        "api",
-                        "statsquery",
-                        "-s",
-                        "127.0.0.1:8080",
-                        "-pattern",
-                        "user>>>",
-                    ])
-                    .output();
-                match output {
-                    Ok(o) => {
-                        let stdout = String::from_utf8_lossy(&o.stdout);
-                        send_json(&mut stream, 200, &stdout);
-                    }
-                    Err(e) => {
-                        send_json(
-                            &mut stream,
-                            500,
-                            &format!(r#"{{"error":"{}"}}"#, e),
-                        );
-                    }
-                }
-            }
-            ("GET", "/online") => {
-                let output = std::process::Command::new("docker")
-                    .args([
-                        "exec",
-                        &container,
-                        "xray",
-                        "api",
-                        "statsquery",
-                        "-s",
-                        "127.0.0.1:8080",
-                        "-pattern",
-                        "user>>>",
-                        "-reset",
-                    ])
-                    .output();
-                match output {
-                    Ok(o) => send_json(&mut stream, 200, &String::from_utf8_lossy(&o.stdout)),
-                    Err(e) => send_json(
-                        &mut stream,
-                        500,
-                        &format!(r#"{{"error":"{}"}}"#, e),
-                    ),
-                }
-            }
-            ("POST", path) if path.starts_with("/add-user/") => {
-                // POST /<secret>/add-user/<uuid>/<email>
-                let parts: Vec<&str> = path
-                    .trim_start_matches("/add-user/")
-                    .splitn(2, '/')
-                    .collect();
-                if parts.len() != 2 {
-                    send_json(
-                        &mut stream,
-                        400,
-                        r#"{"error":"usage: /add-user/<uuid>/<email>"}"#,
-                    );
-                    continue;
-                }
-                let uuid = parts[0];
-                let email = parts[1];
-                let adu_json = format!(
-                    r#"{{"inboundTag":"client-in","user":{{"email":"{}","level":0,"account":{{"id":"{}","encryption":"none"}}}}}}"#,
-                    email, uuid
-                );
-                let output = std::process::Command::new("docker")
-                    .args([
-                        "exec",
-                        &container,
-                        "xray",
-                        "api",
-                        "adu",
-                        "-s",
-                        "127.0.0.1:8080",
-                        &adu_json,
-                    ])
-                    .output();
-                match output {
-                    Ok(o) if o.status.success() => {
-                        send_json(&mut stream, 200, r#"{"ok":true}"#);
-                    }
-                    Ok(o) => {
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        send_json(
-                            &mut stream,
-                            500,
-                            &format!(r#"{{"error":"{}"}}"#, stderr.trim()),
-                        );
-                    }
-                    Err(e) => send_json(
-                        &mut stream,
-                        500,
-                        &format!(r#"{{"error":"{}"}}"#, e),
-                    ),
-                }
-            }
-            ("POST", path) if path.starts_with("/del-user/") => {
-                let email = path.trim_start_matches("/del-user/");
-                let output = std::process::Command::new("docker")
-                    .args([
-                        "exec",
-                        &container,
-                        "xray",
-                        "api",
-                        "rmu",
-                        "-s",
-                        "127.0.0.1:8080",
-                        "-tag=client-in",
-                        email,
-                    ])
-                    .output();
-                match output {
-                    Ok(o) if o.status.success() => {
-                        send_json(&mut stream, 200, r#"{"ok":true}"#);
-                    }
-                    Ok(o) => {
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        send_json(
-                            &mut stream,
-                            500,
-                            &format!(r#"{{"error":"{}"}}"#, stderr.trim()),
-                        );
-                    }
-                    Err(e) => send_json(
-                        &mut stream,
-                        500,
-                        &format!(r#"{{"error":"{}"}}"#, e),
-                    ),
-                }
-            }
-            _ => {
-                send_response(&mut stream, 404, "Not Found");
-            }
+        }
+        _ => {
+            send_response(stream, 404, "Not Found");
         }
     }
     Ok(())

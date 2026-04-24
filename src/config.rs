@@ -187,6 +187,10 @@ pub struct Cli {
     /// HTTP agent listen port (default: 9090)
     #[arg(long = "agent-port", default_value = "9090")]
     pub agent_port: u16,
+
+    /// Bridge agent URL (e.g. http://51.250.73.78:9090/secret-key)
+    #[arg(long = "bridge-agent-url", env = "BRIDGE_AGENT_URL")]
+    pub bridge_agent_url: Option<String>,
 }
 
 /// Application configuration
@@ -219,6 +223,9 @@ pub struct Config {
     /// Host directory for snapshots (default: /data/projects/xray-backup)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_dir: Option<String>,
+    /// Bridge agent base URL (e.g. http://51.250.73.78:9090/secret-key)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_agent_url: Option<String>,
 }
 
 fn default_bot_image() -> String {
@@ -250,6 +257,7 @@ impl Default for Config {
             telegram_admin_chat_id: None,
             bot_image: DEFAULT_BOT_IMAGE.to_string(),
             snapshot_dir: None,
+            bridge_agent_url: None,
         }
     }
 }
@@ -351,6 +359,9 @@ impl Config {
                 );
             }
         }
+        if let Some(ref url) = cli.bridge_agent_url {
+            self.bridge_agent_url = Some(url.clone());
+        }
     }
 
     /// Returns true if this config has enough info to attempt an SSH connection.
@@ -446,6 +457,7 @@ host = "10.0.0.1"
             telegram_admin_chat_id: None,
             bot_image: Default::default(),
             snapshot_dir: None,
+            bridge_agent_url: None,
         };
         config.save_to(&path).unwrap();
 
@@ -515,6 +527,7 @@ host = "10.0.0.1"
             http_agent: false,
             secret: None,
             agent_port: 9090,
+            bridge_agent_url: None,
         };
         config.merge_cli(&cli);
 
@@ -539,6 +552,7 @@ host = "10.0.0.1"
             telegram_admin_chat_id: None,
             bot_image: Default::default(),
             snapshot_dir: None,
+            bridge_agent_url: None,
         };
         let cli = Cli {
             host: None,
@@ -573,6 +587,7 @@ host = "10.0.0.1"
             http_agent: false,
             secret: None,
             agent_port: 9090,
+            bridge_agent_url: None,
         };
         config.merge_cli(&cli);
 
@@ -620,6 +635,7 @@ host = "10.0.0.1"
             http_agent: false,
             secret: None,
             agent_port: 9090,
+            bridge_agent_url: None,
         };
         config.merge_cli(&cli);
         assert_eq!(config, Config::default());
@@ -662,6 +678,7 @@ host = "10.0.0.1"
             telegram_admin_chat_id: None,
             bot_image: Default::default(),
             snapshot_dir: None,
+            bridge_agent_url: None,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
@@ -706,6 +723,7 @@ host = "10.0.0.1"
             telegram_admin_chat_id: Some(987654321),
             bot_image: Default::default(),
             snapshot_dir: None,
+            bridge_agent_url: None,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
