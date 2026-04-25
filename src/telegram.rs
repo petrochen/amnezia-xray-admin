@@ -181,23 +181,22 @@ pub fn format_users_message_with_bridge(
         let bridge = bridge_stats
             .iter()
             .find(|(email, _, _)| email == &user.email);
-        let has_direct = stats.uplink > 0 || stats.downlink > 0;
-        let has_bridge = bridge.is_some();
+        let has_direct_traffic = stats.uplink > 0 || stats.downlink > 0;
+        let bridge_online = !bridge_stats.is_empty();
 
         let traffic = if let Some((_, bup, bdown)) = bridge {
-            // Show bridge traffic (primary for RU users)
             format!("↑{} ↓{}", format_bytes(*bup), format_bytes(*bdown))
-        } else if has_direct {
+        } else if has_direct_traffic {
             format!("↑{} ↓{}", format_bytes(stats.uplink), format_bytes(stats.downlink))
         } else {
             "—".to_string()
         };
 
-        let servers = match (has_bridge, has_direct) {
-            (true, true) => " 🌐",
-            (true, false) => " 🏠",
-            (false, true) => " ✈️",
-            (false, false) => "",
+        // Icon shows where user is REGISTERED, not where traffic exists
+        let servers = if bridge_online {
+            " 🌐" // user exists on both servers
+        } else {
+            " ✈️" // bridge offline, only egress known
         };
 
         lines.push(format!("{} {}: {}{}", online_indicator, name, traffic, servers));

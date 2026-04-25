@@ -2,6 +2,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::time::Duration;
 
+/// Default config path for the bridge Xray container (bind-mounted from host).
+const BRIDGE_CONFIG_PATH: &str = "/etc/xray-bridge/config.json";
+
 pub async fn run_agent(
     port: u16,
     secret: String,
@@ -101,13 +104,22 @@ fn handle_connection(
                 return Ok(());
             }
             let (uuid, email) = (parts[0], parts[1]);
+            // 1. Add to runtime via Xray API (pass JSON via stdin using echo pipe)
             let adu_json = format!(
                 r#"{{"inboundTag":"client-in","user":{{"email":"{}","level":0,"account":{{"id":"{}","encryption":"none"}}}}}}"#,
                 email, uuid
             );
             let output = std::process::Command::new("docker")
-                .args(["exec", container, "xray", "api", "adu", "-s", "127.0.0.1:8080", &adu_json])
+                .args(["exec", "-i", container, "sh", "-c",
+                    &format!("echo '{}' | xray api adu -s 127.0.0.1:8080", adu_json)])
                 .output();
+            let api_ok = matches!(&output, Ok(o) if o.status.success());
+            // 2. Persist to config.json (survives container restart)
+            if api_ok {
+                if let Err(e) = persist_add_user(uuid, email) {
+                    log::warn!("API add OK but config persist failed: {}", e);
+                }
+            }
             match output {
                 Ok(o) if o.status.success() => send_json(stream, 200, r#"{"ok":true}"#),
                 Ok(o) => send_json(stream, 500, &format!(r#"{{"error":"{}"}}"#, String::from_utf8_lossy(&o.stderr).trim())),
@@ -116,9 +128,17 @@ fn handle_connection(
         }
         ("POST", action) if action.starts_with("/del-user/") => {
             let email = action.trim_start_matches("/del-user/");
+            // 1. Remove from runtime via Xray API
             let output = std::process::Command::new("docker")
                 .args(["exec", container, "xray", "api", "rmu", "-s", "127.0.0.1:8080", "-tag=client-in", email])
                 .output();
+            let api_ok = matches!(&output, Ok(o) if o.status.success());
+            // 2. Remove from config.json (survives container restart)
+            if api_ok {
+                if let Err(e) = persist_del_user(email) {
+                    log::warn!("API del OK but config persist failed: {}", e);
+                }
+            }
             match output {
                 Ok(o) if o.status.success() => send_json(stream, 200, r#"{"ok":true}"#),
                 Ok(o) => send_json(stream, 500, &format!(r#"{{"error":"{}"}}"#, String::from_utf8_lossy(&o.stderr).trim())),
@@ -128,6 +148,54 @@ fn handle_connection(
         _ => {
             send_response(stream, 404, "Not Found");
         }
+    }
+    Ok(())
+}
+
+/// Add user to bridge config.json on disk.
+fn persist_add_user(uuid: &str, email: &str) -> Result<(), String> {
+    let data = std::fs::read_to_string(BRIDGE_CONFIG_PATH)
+        .map_err(|e| format!("read config: {}", e))?;
+    let mut config: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| format!("parse config: {}", e))?;
+
+    let clients = config
+        .pointer_mut("/inbounds/0/settings/clients")
+        .and_then(|c| c.as_array_mut())
+        .ok_or("no clients array in config")?;
+
+    // Don't add duplicate
+    if clients.iter().any(|c| c.get("id").and_then(|v| v.as_str()) == Some(uuid)) {
+        return Ok(());
+    }
+
+    clients.push(serde_json::json!({"id": uuid, "email": email}));
+
+    let output = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {}", e))?;
+    std::fs::write(BRIDGE_CONFIG_PATH, output).map_err(|e| format!("write config: {}", e))?;
+    log::info!("Persisted add-user {} to {}", email, BRIDGE_CONFIG_PATH);
+    Ok(())
+}
+
+/// Remove user from bridge config.json on disk.
+fn persist_del_user(email: &str) -> Result<(), String> {
+    let data = std::fs::read_to_string(BRIDGE_CONFIG_PATH)
+        .map_err(|e| format!("read config: {}", e))?;
+    let mut config: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| format!("parse config: {}", e))?;
+
+    let clients = config
+        .pointer_mut("/inbounds/0/settings/clients")
+        .and_then(|c| c.as_array_mut())
+        .ok_or("no clients array in config")?;
+
+    let before = clients.len();
+    clients.retain(|c| c.get("email").and_then(|v| v.as_str()) != Some(email));
+
+    if clients.len() < before {
+        let output = serde_json::to_string_pretty(&config).map_err(|e| format!("serialize: {}", e))?;
+        std::fs::write(BRIDGE_CONFIG_PATH, output).map_err(|e| format!("write config: {}", e))?;
+        log::info!("Persisted del-user {} from {}", email, BRIDGE_CONFIG_PATH);
     }
     Ok(())
 }
