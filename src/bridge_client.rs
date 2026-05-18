@@ -199,7 +199,8 @@ mod tests {
 
     #[test]
     fn test_parse_bridge_online_basic() {
-        let json = r#"{"users":[{"email":"alex@vpn","online":2},{"email":"kostya@vpn","online":0}]}"#;
+        let json =
+            r#"{"users":[{"email":"alex@vpn","online":2},{"email":"kostya@vpn","online":0}]}"#;
         let result = parse_bridge_online(json);
         assert_eq!(result.len(), 2);
         let alex = result.iter().find(|(e, _)| e == "alex@vpn").unwrap();

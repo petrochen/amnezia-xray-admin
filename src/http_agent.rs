@@ -111,10 +111,7 @@ fn handle_connection(
                 }
                 let lower = trimmed.to_ascii_lowercase();
                 if lower.starts_with("content-length:") {
-                    content_length = lower["content-length:".len()..]
-                        .trim()
-                        .parse()
-                        .unwrap_or(0);
+                    content_length = lower["content-length:".len()..].trim().parse().unwrap_or(0);
                 }
             }
             Err(_) => break,
@@ -159,11 +156,7 @@ fn handle_connection(
                 200
             }
             Err(e) => {
-                send_json(
-                    stream,
-                    500,
-                    &format!(r#"{{"error":"read config: {}"}}"#, e),
-                );
+                send_json(stream, 500, &format!(r#"{{"error":"read config: {}"}}"#, e));
                 500
             }
         },
@@ -181,11 +174,7 @@ fn handle_connection(
                         200
                     }
                     Err(e) => {
-                        send_json(
-                            stream,
-                            500,
-                            &format!(r#"{{"error":"{}"}}"#, e),
-                        );
+                        send_json(stream, 500, &format!(r#"{{"error":"{}"}}"#, e));
                         500
                     }
                 }
@@ -378,11 +367,7 @@ fn user_emails_from_config() -> Vec<String> {
         .map(|clients| {
             clients
                 .iter()
-                .filter_map(|c| {
-                    c.get("email")
-                        .and_then(|e| e.as_str())
-                        .map(String::from)
-                })
+                .filter_map(|c| c.get("email").and_then(|e| e.as_str()).map(String::from))
                 .collect()
         })
         .unwrap_or_default()

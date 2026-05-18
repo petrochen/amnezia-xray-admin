@@ -180,7 +180,11 @@ pub fn format_users_message_with_bridge(
             .find(|(email, _)| email == &user.email)
             .map(|(_, c)| *c)
             .unwrap_or(0);
-        let display_count = if bridge_count > 0 { bridge_count } else { *online_count };
+        let display_count = if bridge_count > 0 {
+            bridge_count
+        } else {
+            *online_count
+        };
         let online_indicator = if display_count > 0 {
             format!("🟢 {}", display_count)
         } else {
@@ -982,8 +986,7 @@ async fn cmd_restore(
     let bridge_agent_url = state.config.lock().await.bridge_agent_url.clone();
     if let Some(url) = bridge_agent_url {
         let bc = crate::bridge_client::BridgeClient::new(url);
-        match snapshot::restore_bridge_config(state.backend.as_ref(), &bc, &snapshot_dir, tag)
-            .await
+        match snapshot::restore_bridge_config(state.backend.as_ref(), &bc, &snapshot_dir, tag).await
         {
             Ok(()) => msg.push_str("\nBridge: restored."),
             Err(e) => {

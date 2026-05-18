@@ -558,10 +558,7 @@ pub async fn backup_bridge_config(
     let b64 = base64::engine::general_purpose::STANDARD.encode(config.as_bytes());
     let path = format!("{}/{}/bridge-config.json", snapshot_dir, tag);
     backend
-        .exec_on_host(&format!(
-            "printf '%s' '{}' | base64 -d > {}",
-            b64, path
-        ))
+        .exec_on_host(&format!("printf '%s' '{}' | base64 -d > {}", b64, path))
         .await?;
     Ok(())
 }
