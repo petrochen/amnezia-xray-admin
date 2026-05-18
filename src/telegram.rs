@@ -152,6 +152,7 @@ pub fn format_users_message(users: &[(XrayUser, TrafficStats, u32)]) -> String {
 pub fn format_users_message_with_bridge(
     users: &[(XrayUser, TrafficStats, u32)],
     bridge_stats: &[(String, u64, u64)],
+    bridge_online_counts: &[(String, u32)],
 ) -> String {
     let mut lines = Vec::new();
     lines.push("👥 Users:".to_string());
@@ -172,8 +173,16 @@ pub fn format_users_message_with_bridge(
         } else {
             &user.name
         };
-        let online_indicator = if *online_count > 0 {
-            format!("🟢 {}", online_count)
+        // Bridge online takes precedence: Russian users connect via bridge,
+        // so egress statsonline always returns 0 for them.
+        let bridge_count = bridge_online_counts
+            .iter()
+            .find(|(email, _)| email == &user.email)
+            .map(|(_, c)| *c)
+            .unwrap_or(0);
+        let display_count = if bridge_count > 0 { bridge_count } else { *online_count };
+        let online_indicator = if display_count > 0 {
+            format!("🟢 {}", display_count)
         } else {
             "⚪".to_string()
         };
@@ -187,7 +196,11 @@ pub fn format_users_message_with_bridge(
         let traffic = if let Some((_, bup, bdown)) = bridge {
             format!("↑{} ↓{}", format_bytes(*bup), format_bytes(*bdown))
         } else if has_direct_traffic {
-            format!("↑{} ↓{}", format_bytes(stats.uplink), format_bytes(stats.downlink))
+            format!(
+                "↑{} ↓{}",
+                format_bytes(stats.uplink),
+                format_bytes(stats.downlink)
+            )
         } else {
             "—".to_string()
         };
@@ -199,7 +212,10 @@ pub fn format_users_message_with_bridge(
             " ✈️" // bridge offline, only egress known
         };
 
-        lines.push(format!("{} {}: {}{}", online_indicator, name, traffic, servers));
+        lines.push(format!(
+            "{} {}: {}{}",
+            online_indicator, name, traffic, servers
+        ));
     }
 
     // Second: bridge-only users (not on egress)
@@ -690,13 +706,21 @@ async fn cmd_users(state: &BotState) -> std::result::Result<String, crate::error
         user_data.push((user, stats, online));
     }
 
-    // Fetch bridge stats if configured and annotate the output
+    // Fetch bridge stats + online counts if configured
     let bridge_url = state.config.lock().await.bridge_agent_url.clone();
     if let Some(url) = bridge_url {
         let bridge_client = crate::bridge_client::BridgeClient::new(url);
-        if let Ok(json) = bridge_client.get_stats() {
-            let bridge_stats = crate::bridge_client::parse_bridge_stats(&json);
-            return Ok(format_users_message_with_bridge(&user_data, &bridge_stats));
+        let bridge_stats = bridge_client
+            .get_stats()
+            .map(|json| crate::bridge_client::parse_bridge_stats(&json))
+            .unwrap_or_default();
+        let bridge_online = bridge_client.get_online().unwrap_or_default();
+        if !bridge_stats.is_empty() || !bridge_online.is_empty() {
+            return Ok(format_users_message_with_bridge(
+                &user_data,
+                &bridge_stats,
+                &bridge_online,
+            ));
         }
     }
 
@@ -833,10 +857,7 @@ async fn cmd_qr(
 
     let direct_png = render_qr_to_png(&direct_url, 8)
         .map_err(|e| crate::error::AppError::Xray(format!("QR generation failed: {}", e)))?;
-    results.push((
-        direct_png,
-        format!("🌍 Direct (abroad) — {}", name),
-    ));
+    results.push((direct_png, format!("🌍 Direct (abroad) — {}", name)));
 
     Ok(results)
 }
@@ -851,13 +872,38 @@ async fn cmd_snapshot(
 
     let snapshot_dir = state.config.lock().await.snapshot_dir().to_string();
     let info = snapshot::create_snapshot(state.backend.as_ref(), &snapshot_dir).await?;
+
+    // Bridge backup (best-effort — failure does not abort the snapshot)
+    let bridge_note = {
+        let bridge_agent_url = state.config.lock().await.bridge_agent_url.clone();
+        if let Some(url) = bridge_agent_url {
+            let bc = crate::bridge_client::BridgeClient::new(url);
+            match snapshot::backup_bridge_config(
+                state.backend.as_ref(),
+                &bc,
+                &snapshot_dir,
+                &info.tag,
+            )
+            .await
+            {
+                Ok(()) => " + bridge".to_string(),
+                Err(e) => {
+                    log::warn!("Bridge backup failed (non-fatal): {}", e);
+                    " (bridge skipped)".to_string()
+                }
+            }
+        } else {
+            String::new()
+        }
+    };
+
     let zip_bytes =
         snapshot::pack_snapshot_zip(state.backend.as_ref(), &info.tag, &snapshot_dir).await?;
 
     let file_name = format!("snapshot-{}.tar.gz", info.tag);
     let caption = format!(
-        "\u{1f4e6} Snapshot {} | v{} | {} users",
-        info.tag, info.version, info.users_count
+        "\u{1f4e6} Snapshot {} | v{} | {} users{}",
+        info.tag, info.version, info.users_count, bridge_note
     );
     let input = InputFile::memory(zip_bytes).file_name(file_name);
     bot.send_document(chat_id, input)
@@ -926,10 +972,28 @@ async fn cmd_restore(
 ) -> std::result::Result<String, crate::error::AppError> {
     let snapshot_dir = state.config.lock().await.snapshot_dir().to_string();
     snapshot::restore_snapshot(state.backend.as_ref(), tag, &snapshot_dir).await?;
-    Ok(format!(
+
+    let mut msg = format!(
         "\u{2705} Restored from snapshot [{}]. Container restarted.",
         tag
-    ))
+    );
+
+    // Bridge restore (best-effort)
+    let bridge_agent_url = state.config.lock().await.bridge_agent_url.clone();
+    if let Some(url) = bridge_agent_url {
+        let bc = crate::bridge_client::BridgeClient::new(url);
+        match snapshot::restore_bridge_config(state.backend.as_ref(), &bc, &snapshot_dir, tag)
+            .await
+        {
+            Ok(()) => msg.push_str("\nBridge: restored."),
+            Err(e) => {
+                log::warn!("Bridge restore failed (non-fatal): {}", e);
+                msg.push_str(&format!("\n\u{26a0}\u{fe0f} Bridge restore failed: {}", e));
+            }
+        }
+    }
+
+    Ok(msg)
 }
 
 /// Execute /upgrade command: show confirmation before proceeding.
@@ -985,6 +1049,24 @@ async fn cmd_upgrade_execute(
     let snapshot_dir = state.config.lock().await.snapshot_dir().to_string();
     let result = snapshot::upgrade_xray(state.backend.as_ref(), &snapshot_dir).await?;
 
+    // Bridge backup for pre-upgrade snapshot (best-effort)
+    {
+        let bridge_agent_url = state.config.lock().await.bridge_agent_url.clone();
+        if let Some(url) = bridge_agent_url {
+            let bc = crate::bridge_client::BridgeClient::new(url);
+            if let Err(e) = snapshot::backup_bridge_config(
+                state.backend.as_ref(),
+                &bc,
+                &snapshot_dir,
+                &result.snapshot_tag,
+            )
+            .await
+            {
+                log::warn!("Bridge backup during upgrade failed (non-fatal): {}", e);
+            }
+        }
+    }
+
     // Send pre-upgrade backup as document
     match snapshot::pack_snapshot_zip(state.backend.as_ref(), &result.snapshot_tag, &snapshot_dir)
         .await
@@ -1016,12 +1098,6 @@ async fn cmd_upgrade_execute(
     .ok();
 
     Ok(())
-}
-
-/// Format the /url response: vless:// URL as a copyable message.
-#[allow(dead_code)]
-pub fn format_url_message(name: &str, vless_url: &str) -> String {
-    format!("🔗 {} URL:\n\n<pre>{}</pre>", name, vless_url)
 }
 
 /// Handle callback queries from inline keyboard buttons (e.g., delete confirmation).
@@ -1184,10 +1260,15 @@ async fn cmd_status(state: &BotState) -> std::result::Result<String, crate::erro
         latest_version.as_deref(),
     );
 
-    // Append bridge agent health status if configured
+    // Append bridge agent health + online count from bridge
     let bridge_agent_url = state.config.lock().await.bridge_agent_url.clone();
     if let Some(agent_url) = bridge_agent_url {
         let agent = crate::bridge_client::BridgeClient::new(agent_url);
+        // Russian users connect via bridge — add their online count to total
+        if let Ok(bridge_online) = agent.get_online() {
+            let bridge_total: u32 = bridge_online.iter().map(|(_, c)| c).sum();
+            online_total += bridge_total as usize;
+        }
         let bridge_status = match agent.health() {
             Ok(true) => "Bridge: ✅ online",
             _ => "Bridge: ❌ offline",
@@ -1331,7 +1412,11 @@ mod tests {
         );
         assert!(descriptions.contains("add"), "commands: {}", descriptions);
         assert!(descriptions.contains("del"), "commands: {}", descriptions);
-        assert!(descriptions.contains("config"), "commands: {}", descriptions);
+        assert!(
+            descriptions.contains("config"),
+            "commands: {}",
+            descriptions
+        );
     }
 
     #[test]
@@ -1490,7 +1575,12 @@ mod tests {
 
     #[test]
     fn test_format_add_message_special_name() {
-        let text = format_add_message("Bob's Phone [iOS]", "uuid-456", "vless://bridge...", "vless://direct...");
+        let text = format_add_message(
+            "Bob's Phone [iOS]",
+            "uuid-456",
+            "vless://bridge...",
+            "vless://direct...",
+        );
         assert!(text.contains("Bob's Phone [iOS]"), "text: {}", text);
     }
 
@@ -1589,22 +1679,6 @@ mod tests {
         assert!(result.contains("/add"), "result: {}", result);
     }
 
-    // -- /url formatting tests --
-
-    #[test]
-    fn test_format_url_message() {
-        let text = format_url_message("Alice", "vless://uuid@1.2.3.4:443?test=1#Alice");
-        assert!(text.contains("Alice"), "text: {}", text);
-        assert!(text.contains("vless://"), "text: {}", text);
-        assert!(text.contains("🔗"), "text: {}", text);
-    }
-
-    #[test]
-    fn test_format_url_message_special_name() {
-        let text = format_url_message("Bob's Phone [iOS]", "vless://...");
-        assert!(text.contains("Bob's Phone [iOS]"), "text: {}", text);
-    }
-
     #[test]
     fn test_bot_commands_include_config_and_qr() {
         let cmds = Command::bot_commands();
@@ -1613,7 +1687,11 @@ mod tests {
             .map(|c| c.command.as_str())
             .collect::<Vec<_>>()
             .join(",");
-        assert!(descriptions.contains("config"), "commands: {}", descriptions);
+        assert!(
+            descriptions.contains("config"),
+            "commands: {}",
+            descriptions
+        );
         assert!(descriptions.contains("qr"), "commands: {}", descriptions);
     }
 

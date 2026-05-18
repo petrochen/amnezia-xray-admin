@@ -133,7 +133,7 @@ pub async fn create_snapshot(
     }
 
     // Copy xray binary
-    let bin_src = format!("{}:/usr/bin/xray", container);
+    let bin_src = format!("{}:/usr/local/bin/xray", container);
     let bin_dst = format!("{}/xray", snapshot_path);
     let result = backend
         .exec_on_host(&format!("docker cp {} {} && echo OK", bin_src, bin_dst))
@@ -261,10 +261,10 @@ pub async fn restore_snapshot(
 
     // Copy xray binary
     let bin_src = format!("{}/xray", snapshot_path);
-    let bin_dst = format!("{}:/usr/bin/xray", container);
+    let bin_dst = format!("{}:/usr/local/bin/xray", container);
     let result = backend
         .exec_on_host(&format!(
-            "docker cp {} {} && docker exec {} chmod +x /usr/bin/xray && echo OK",
+            "docker cp {} {} && docker exec {} chmod +x /usr/local/bin/xray && echo OK",
             bin_src, bin_dst, container
         ))
         .await?;
@@ -288,7 +288,7 @@ pub async fn restore_snapshot(
 /// Validates the returned version to prevent injection of arbitrary strings.
 pub async fn get_latest_xray_version(backend: &dyn XrayBackend) -> Result<String> {
     let result = backend
-        .exec_on_host("curl -sf --max-time 10 https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep tag_name | cut -d'\"' -f4 | tr -d 'v'")
+        .exec_on_host("curl -sf --max-time 10 https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r '.tag_name' | tr -d 'v'")
         .await
         .map_err(|e| AppError::Xray(format!("failed to check latest version: {}", e)))?;
 
@@ -429,8 +429,8 @@ pub async fn upgrade_xray(backend: &dyn XrayBackend, snapshot_dir: &str) -> Resu
     // Replace binary in container + restart (rollback on failure)
     let replace_and_restart = async {
         let replace_cmd = format!(
-            "docker cp /tmp/xray {}:/usr/bin/xray && \
-             docker exec {} chmod +x /usr/bin/xray && \
+            "docker cp /tmp/xray {}:/usr/local/bin/xray && \
+             docker exec {} chmod +x /usr/local/bin/xray && \
              echo OK",
             container, container
         );
@@ -538,6 +538,76 @@ pub async fn pack_snapshot_zip(
         .map_err(|e| AppError::Xray(format!("failed to decode snapshot archive: {}", e)))?;
 
     Ok(bytes)
+}
+
+/// Back up the bridge `config.json` into an existing snapshot directory.
+///
+/// Fetches the config via the bridge-agent HTTP API and writes it to
+/// `<snapshot_dir>/<tag>/bridge-config.json` on the egress host.
+/// Best-effort: callers should log and ignore errors rather than failing the snapshot.
+pub async fn backup_bridge_config(
+    backend: &dyn XrayBackend,
+    bridge_client: &crate::bridge_client::BridgeClient,
+    snapshot_dir: &str,
+    tag: &str,
+) -> Result<()> {
+    validate_tag(tag)?;
+    let config = bridge_client
+        .get_backup()
+        .map_err(|e| AppError::Xray(format!("bridge backup fetch: {}", e)))?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(config.as_bytes());
+    let path = format!("{}/{}/bridge-config.json", snapshot_dir, tag);
+    backend
+        .exec_on_host(&format!(
+            "printf '%s' '{}' | base64 -d > {}",
+            b64, path
+        ))
+        .await?;
+    Ok(())
+}
+
+/// Restore the bridge `config.json` from a snapshot.
+///
+/// Reads `<snapshot_dir>/<tag>/bridge-config.json` from the egress host and
+/// sends it to the bridge-agent HTTP API, which overwrites the file and
+/// restarts the xray-bridge container.
+/// Silently succeeds for old snapshots that predate bridge backups.
+/// Best-effort: callers should log and ignore errors rather than failing the restore.
+pub async fn restore_bridge_config(
+    backend: &dyn XrayBackend,
+    bridge_client: &crate::bridge_client::BridgeClient,
+    snapshot_dir: &str,
+    tag: &str,
+) -> Result<()> {
+    validate_tag(tag)?;
+    let path = format!("{}/{}/bridge-config.json", snapshot_dir, tag);
+
+    // Skip silently for snapshots taken before bridge backup was added
+    let check = backend
+        .exec_on_host(&format!("test -f {} && echo OK", path))
+        .await?;
+    if !check.stdout.contains("OK") {
+        return Ok(());
+    }
+
+    let result = backend
+        .exec_on_host(&format!("cat {} | base64", path))
+        .await?;
+    let b64_clean: String = result
+        .stdout
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&b64_clean)
+        .map_err(|e| AppError::Xray(format!("decode bridge config: {}", e)))?;
+    let config = String::from_utf8(bytes)
+        .map_err(|e| AppError::Xray(format!("bridge config not UTF-8: {}", e)))?;
+
+    bridge_client
+        .restore_backup(&config)
+        .map_err(|e| AppError::Xray(format!("bridge restore: {}", e)))?;
+    Ok(())
 }
 
 #[cfg(test)]
