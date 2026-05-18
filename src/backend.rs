@@ -10,7 +10,7 @@ use crate::config::Config;
 use crate::error::AppError;
 use crate::ssh::{expand_tilde, resolve_ssh_host, SshSession};
 use crate::ui::telegram_setup::DeployStatus;
-use crate::xray::client::{generate_amnezia_url, generate_vless_url, ServerInfo, XrayApiClient};
+use crate::xray::client::{generate_vless_url, ServerInfo, XrayApiClient};
 use crate::xray::config::{ensure_api_enabled, read_server_config};
 use crate::xray::types::{VlessUrlParams, XrayUser};
 
@@ -124,6 +124,92 @@ fn parse_xray_version_from_json(body: &str) -> Option<String> {
     Some(version.to_string())
 }
 
+/// Host system metrics fetched from /proc and df.
+pub struct HostMetrics {
+    pub load_1min: f32,
+    pub mem_used_mb: u64,
+    pub mem_total_mb: u64,
+    pub disk_used_gb: u64,
+    pub disk_total_gb: u64,
+    pub uptime_secs: u64,
+}
+
+impl HostMetrics {
+    pub fn mem_percent(&self) -> u64 {
+        if self.mem_total_mb == 0 {
+            return 0;
+        }
+        self.mem_used_mb * 100 / self.mem_total_mb
+    }
+
+    pub fn disk_percent(&self) -> u64 {
+        if self.disk_total_gb == 0 {
+            return 0;
+        }
+        self.disk_used_gb * 100 / self.disk_total_gb
+    }
+
+    pub fn uptime_human(&self) -> String {
+        let s = self.uptime_secs;
+        let days = s / 86400;
+        let hours = (s % 86400) / 3600;
+        let mins = (s % 3600) / 60;
+        if days > 0 {
+            format!("{}d {}h", days, hours)
+        } else if hours > 0 {
+            format!("{}h {}m", hours, mins)
+        } else {
+            format!("{}m", mins)
+        }
+    }
+}
+
+/// Fetch host system metrics via /proc and df.
+///
+/// Runs a single compound shell command to minimise round-trips.
+/// Returns `None` on any parse failure so callers can degrade gracefully.
+pub async fn fetch_host_metrics(backend: &dyn XrayBackend) -> Option<HostMetrics> {
+    let cmd = "awk '/MemTotal/{t=$2}/MemAvailable/{a=$2}END{print t,a}' /proc/meminfo; \
+               cut -d' ' -f1 /proc/loadavg; \
+               awk '{print int($1)}' /proc/uptime; \
+               df -k / | awk 'NR==2{print $2,$3}'";
+    let out = backend.exec_on_host(cmd).await.ok()?;
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    if lines.len() < 4 {
+        return None;
+    }
+
+    let mem: Vec<u64> = lines[0]
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    if mem.len() < 2 {
+        return None;
+    }
+    let (mem_total_kb, mem_avail_kb) = (mem[0], mem[1]);
+
+    let load_1min: f32 = lines[1].trim().parse().ok()?;
+    let uptime_secs: u64 = lines[2].trim().parse().ok()?;
+
+    let disk: Vec<u64> = lines[3]
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    if disk.len() < 2 {
+        return None;
+    }
+    let (disk_total_kb, disk_used_kb) = (disk[0], disk[1]);
+
+    Some(HostMetrics {
+        load_1min,
+        mem_used_mb: (mem_total_kb.saturating_sub(mem_avail_kb)) / 1024,
+        mem_total_mb: mem_total_kb / 1024,
+        disk_used_gb: disk_used_kb / 1024 / 1024,
+        disk_total_gb: disk_total_kb / 1024 / 1024,
+        uptime_secs,
+    })
+}
+
 /// Result of adding a user
 pub struct AddedUser {
     pub name: String,
@@ -223,7 +309,8 @@ pub async fn read_bridge_params(backend: &dyn XrayBackend) -> Result<BridgeParam
         .to_string();
     let port = v["port"]
         .as_u64()
-        .ok_or_else(|| AppError::Xray("bridge-params.json missing 'port'".to_string()))? as u16;
+        .ok_or_else(|| AppError::Xray("bridge-params.json missing 'port'".to_string()))?
+        as u16;
     let public_key = v["publicKey"]
         .as_str()
         .ok_or_else(|| AppError::Xray("bridge-params.json missing 'publicKey'".to_string()))?
@@ -240,7 +327,14 @@ pub async fn read_bridge_params(backend: &dyn XrayBackend) -> Result<BridgeParam
         .as_str()
         .ok_or_else(|| AppError::Xray("bridge-params.json missing 'path'".to_string()))?
         .to_string();
-    Ok(BridgeParams { host, port, public_key, short_id, sni, path })
+    Ok(BridgeParams {
+        host,
+        port,
+        public_key,
+        short_id,
+        sni,
+        path,
+    })
 }
 
 /// Build VlessUrlParams from live server config. Reused by vless:// and vpn:// generators.
@@ -304,22 +398,9 @@ pub async fn build_direct_vless_url(
 }
 
 /// Build a vless:// URL for a user, using live server config for reality params.
-pub async fn build_vless_url(
-    backend: &dyn XrayBackend,
-    uuid: &str,
-) -> Result<String, AppError> {
+pub async fn build_vless_url(backend: &dyn XrayBackend, uuid: &str) -> Result<String, AppError> {
     let params = build_vless_params(backend, uuid).await?;
     Ok(generate_vless_url(&params))
-}
-
-/// Build a vpn:// connection string for a user (compressed Xray config).
-#[allow(dead_code)]
-pub async fn build_amnezia_url(
-    backend: &dyn XrayBackend,
-    uuid: &str,
-) -> Result<String, AppError> {
-    let params = build_vless_params(backend, uuid).await?;
-    Ok(generate_amnezia_url(&params))
 }
 
 /// Spawn: fetch dashboard data (user list + server info + per-user stats).

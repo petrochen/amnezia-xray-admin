@@ -4,6 +4,51 @@
 
 use std::time::Duration;
 
+/// Host system metrics from the bridge server.
+#[derive(serde::Deserialize, Default)]
+pub struct BridgeSysinfo {
+    #[serde(default)]
+    pub load_1min: String,
+    #[serde(default)]
+    pub mem_used_mb: u64,
+    #[serde(default)]
+    pub mem_total_mb: u64,
+    #[serde(default)]
+    pub disk_used_gb: u64,
+    #[serde(default)]
+    pub disk_total_gb: u64,
+    #[serde(default)]
+    pub uptime_secs: u64,
+}
+
+impl BridgeSysinfo {
+    pub fn mem_percent(&self) -> u64 {
+        if self.mem_total_mb == 0 {
+            return 0;
+        }
+        self.mem_used_mb * 100 / self.mem_total_mb
+    }
+    pub fn disk_percent(&self) -> u64 {
+        if self.disk_total_gb == 0 {
+            return 0;
+        }
+        self.disk_used_gb * 100 / self.disk_total_gb
+    }
+    pub fn uptime_human(&self) -> String {
+        let s = self.uptime_secs;
+        let days = s / 86400;
+        let hours = (s % 86400) / 3600;
+        let mins = (s % 3600) / 60;
+        if days > 0 {
+            format!("{}d {}h", days, hours)
+        } else if hours > 0 {
+            format!("{}h {}m", hours, mins)
+        } else {
+            format!("{}m", mins)
+        }
+    }
+}
+
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct BridgeClient {
@@ -60,6 +105,12 @@ impl BridgeClient {
         } else {
             Err(body)
         }
+    }
+
+    /// GET /<secret>/sysinfo — returns host metrics from bridge server
+    pub fn get_sysinfo(&self) -> Result<BridgeSysinfo, String> {
+        let json = self.http_get("/sysinfo")?;
+        serde_json::from_str(&json).map_err(|e| format!("parse sysinfo: {}", e))
     }
 
     /// GET /<secret>/backup — returns raw config.json content

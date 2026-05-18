@@ -443,25 +443,65 @@ pub fn format_status_message(
     uptime: &str,
     latest_version: Option<&str>,
 ) -> String {
+    format_status_message_with_metrics(
+        server_info,
+        user_count,
+        online_count,
+        uptime,
+        latest_version,
+        None,
+    )
+}
+
+pub fn format_status_message_with_metrics(
+    server_info: &ServerInfo,
+    user_count: usize,
+    online_count: usize,
+    uptime: &str,
+    latest_version: Option<&str>,
+    host_metrics: Option<&crate::backend::HostMetrics>,
+) -> String {
     let mut lines = Vec::new();
-    lines.push("📊 Server Status:".to_string());
+    lines.push("📊 VPN Status".to_string());
     lines.push(String::new());
 
+    lines.push("🖥 Egress (94.131.13.243)".to_string());
     let version_line = match latest_version {
         Some(latest) if latest != server_info.version => {
-            format!("Xray: v{} (⬆️ v{} available)", server_info.version, latest)
+            format!("Xray v{} (⬆️ v{} available)", server_info.version, latest)
         }
-        Some(_) => format!("Xray: v{} ✅", server_info.version),
-        None => format!("Xray: v{}", server_info.version),
+        Some(_) => format!("Xray v{} ✅", server_info.version),
+        None => format!("Xray v{}", server_info.version),
     };
     lines.push(version_line);
 
     if !uptime.is_empty() {
-        lines.push(format!("Uptime: {}", uptime));
+        lines.push(format!("Container: {}", uptime));
     }
-    lines.push(format!("Users: {} ({} online)", user_count, online_count));
-    lines.push(format!("Upload: {}", format_bytes(server_info.uplink)));
-    lines.push(format!("Download: {}", format_bytes(server_info.downlink)));
+    lines.push(format!(
+        "Users: {} ({} online)  ↑{} ↓{}",
+        user_count,
+        online_count,
+        format_bytes(server_info.uplink),
+        format_bytes(server_info.downlink),
+    ));
+
+    if let Some(m) = host_metrics {
+        lines.push(format!(
+            "RAM: {}/{} MB ({}%)  Load: {}",
+            m.mem_used_mb,
+            m.mem_total_mb,
+            m.mem_percent(),
+            m.load_1min
+        ));
+        lines.push(format!(
+            "Disk: {}/{} GB ({}%)  Up: {}",
+            m.disk_used_gb,
+            m.disk_total_gb,
+            m.disk_percent(),
+            m.uptime_human()
+        ));
+    }
 
     lines.join("\n")
 }
@@ -1254,32 +1294,58 @@ async fn cmd_status(state: &BotState) -> std::result::Result<String, crate::erro
 
     let uptime = crate::backend::fetch_container_uptime(state.backend.as_ref()).await;
     let latest_version = crate::backend::fetch_latest_xray_version(state.backend.as_ref()).await;
+    let host_metrics = crate::backend::fetch_host_metrics(state.backend.as_ref()).await;
 
-    let mut text = format_status_message(
+    let mut text = format_status_message_with_metrics(
         &server_info,
         users.len(),
         online_total,
         &uptime,
         latest_version.as_deref(),
+        host_metrics.as_ref(),
     );
 
-    // Append bridge agent health + online count from bridge
+    // Bridge section
     let bridge_agent_url = state.config.lock().await.bridge_agent_url.clone();
     if let Some(agent_url) = bridge_agent_url {
         let agent = crate::bridge_client::BridgeClient::new(agent_url);
-        // Russian users connect via bridge — add their online count to total
+
+        // Add bridge online count to total
         if let Ok(bridge_online) = agent.get_online() {
             let bridge_total: u32 = bridge_online.iter().map(|(_, c)| c).sum();
             online_total += bridge_total as usize;
         }
-        let bridge_status = match agent.health() {
-            Ok(true) => "Bridge: ✅ online",
-            _ => "Bridge: ❌ offline",
-        };
-        text.push('\n');
-        text.push_str(bridge_status);
+
+        text.push_str("\n\n🌉 Bridge (51.250.73.78)");
+        match agent.health() {
+            Ok(true) => text.push_str(" ✅"),
+            _ => text.push_str(" ❌"),
+        }
+
+        match agent.get_sysinfo() {
+            Ok(si) => {
+                text.push_str(&format!(
+                    "\nRAM: {}/{} MB ({}%)  Load: {}",
+                    si.mem_used_mb,
+                    si.mem_total_mb,
+                    si.mem_percent(),
+                    si.load_1min
+                ));
+                text.push_str(&format!(
+                    "\nDisk: {}/{} GB ({}%)  Up: {}",
+                    si.disk_used_gb,
+                    si.disk_total_gb,
+                    si.disk_percent(),
+                    si.uptime_human()
+                ));
+            }
+            Err(e) => {
+                log::warn!("Bridge sysinfo unavailable: {}", e);
+            }
+        }
     }
 
+    let _ = online_total; // used above for bridge count aggregation
     Ok(text)
 }
 

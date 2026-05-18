@@ -150,6 +150,10 @@ fn handle_connection(
             send_json(stream, 200, r#"{"ok":true}"#);
             200
         }
+        ("GET", "/sysinfo") => {
+            send_json(stream, 200, &collect_sysinfo());
+            200
+        }
         ("GET", "/backup") => match std::fs::read_to_string(BRIDGE_CONFIG_PATH) {
             Ok(config) => {
                 send_json(stream, 200, &config);
@@ -384,6 +388,64 @@ fn parse_statsonline(output: &str) -> u32 {
         })
         .map(|v| v.max(0) as u32)
         .unwrap_or(0)
+}
+
+/// Collect host system metrics from /proc and df, return as JSON string.
+fn collect_sysinfo() -> String {
+    let mem = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let mut mem_total_kb: u64 = 0;
+    let mut mem_avail_kb: u64 = 0;
+    for line in mem.lines() {
+        if line.starts_with("MemTotal:") {
+            mem_total_kb = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+        } else if line.starts_with("MemAvailable:") {
+            mem_avail_kb = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+        }
+    }
+
+    let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    let load_1min = load.split_whitespace().next().unwrap_or("0").to_string();
+
+    let uptime_raw = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
+    let uptime_secs: u64 = uptime_raw
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.split('.').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let df_out = std::process::Command::new("df")
+        .args(["-k", "/"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    let (disk_total_kb, disk_used_kb): (u64, u64) = df_out
+        .lines()
+        .nth(1)
+        .and_then(|l| {
+            let p: Vec<&str> = l.split_whitespace().collect();
+            Some((p.get(1)?.parse().ok()?, p.get(2)?.parse().ok()?))
+        })
+        .unwrap_or((0, 0));
+
+    format!(
+        r#"{{"load_1min":"{}","mem_used_mb":{},"mem_total_mb":{},"disk_used_gb":{},"disk_total_gb":{},"uptime_secs":{}}}"#,
+        load_1min,
+        mem_total_kb.saturating_sub(mem_avail_kb) / 1024,
+        mem_total_kb / 1024,
+        disk_used_kb / 1024 / 1024,
+        disk_total_kb / 1024 / 1024,
+        uptime_secs,
+    )
 }
 
 /// Atomically overwrite bridge config and restart the xray container.
